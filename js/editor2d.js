@@ -1,10 +1,11 @@
 // 2D plan editor: canvas rendering, pan/zoom, tools, hit-testing and drag logic.
 
 import {
-  GRID, EPS, add, sub, scale, dist, perp, snap, snapPoint, clamp, angleOf, round, pointInPolygon, polygonArea,
+  GRID, EPS, add, sub, scale, dist, dot, lerp, perp, snap, snapPoint, clamp, angleOf, round,
+  pointInPolygon, polygonArea, arcFromChord, arcPointAt, arcSamples, arcOffset, splineBulges,
 } from './geometry.js';
 import { computeWallPolygons } from './model.js';
-import { OPENING_TYPES, STAIR_DEFAULTS } from './catalog.js';
+import { OPENING_TYPES, STAIR_DEFAULTS, openingSpec } from './catalog.js';
 
 const OPENING_SNAP_DIST = 40; // cm: how close the cursor must be to a wall to place an opening
 const DRAG_THRESHOLD = 3;     // px before a press becomes a drag
@@ -15,13 +16,23 @@ const GHOST_ALPHA = 0.3;      // opacity of the level below
 export const TOOLS = {
   select:      { label: 'Select',             key: 'v', hint: 'Click to select, drag to move. Double-click a wall to split it. Drag empty space to pan.' },
   wall:        { label: 'Wall',               key: 'w', hint: 'Click to start, click to add corners. Esc, right-click or double-click ends the chain. Shift keeps it straight.' },
-  door:        { label: 'Door',               key: 'd', opening: 'door' },
-  window:      { label: 'Window',             key: '1', opening: 'window' },
-  window_tall: { label: 'Tall window',        key: '2', opening: 'window_tall' },
-  window_full: { label: 'Full-height window', key: '3', opening: 'window_full' },
+  curve:       { label: 'Curved wall',        key: 'c', hint: 'Click to add points; the walls bend along a spline through them. Esc, right-click or double-click ends the chain.' },
   split:       { label: 'Split',              key: 's', hint: 'Click on a wall to split it into two segments.' },
   floor:       { label: 'Floor',              key: 'g', hint: 'Click to add corners. Click the first corner, double-click or press Enter to close; Esc cancels. Shift keeps edges straight.' },
+  fill:        { label: 'Floor fill',         key: 'r', hint: 'Click inside a room closed by walls to fill it with a floor in one click.' },
+  cutout:      { label: 'Floor cutout',       key: 'h', hint: 'Click to add corners of a hole in the floor. Double-click or press Enter to close; Esc cancels.' },
   stairs:      { label: 'Stairs',             key: 't', hint: 'Click to place a flight climbing to the right; rotate it from its menu. It cuts a stairwell in the floor above.' },
+  door:               { label: 'Door',                     key: 'd', opening: 'door' },
+  door_double:        { label: 'Double door',                        opening: 'door_double' },
+  door_slide:         { label: 'Sliding door',                       opening: 'door_slide' },
+  door_garage:        { label: 'Garage door',                        opening: 'door_garage' },
+  window:             { label: 'Window',                   key: '1', opening: 'window' },
+  window_tall:        { label: 'Tall window',              key: '2', opening: 'window_tall' },
+  window_full:        { label: 'Full-height window',       key: '3', opening: 'window_full' },
+  window_small:       { label: 'Small window',             key: '4', opening: 'window_small' },
+  window_double:      { label: 'Double window',            key: '5', opening: 'window_double' },
+  window_double_tall: { label: 'Double tall window',       key: '6', opening: 'window_double_tall' },
+  window_double_full: { label: 'Double full-height window', key: '7', opening: 'window_double_full' },
 };
 
 const fmtM = (cm) => `${round(cm / 100, 2).toFixed(2)} m`;
@@ -51,7 +62,8 @@ export class Editor2D {
     this.hover = null;
     this.drag = null;
     this.chain = null;     // wall tool: { last: {x,y}, start: {x,y}, count }
-    this.floorDraw = null; // floor tool: { points: [{x,y}] }
+    this.floorDraw = null; // floor / cutout tool: { points: [{x,y}], kind }
+    this.fillPreview = null; // floor fill tool: the room outline under the cursor
     this.stairGhost = null; // stairs tool preview: { x, y }
     this.ghost = null;     // opening tool preview
     this.splitPreview = null;
@@ -154,6 +166,7 @@ export class Editor2D {
     this.ghost = null;
     this.splitPreview = null;
     this.stairGhost = null;
+    this.fillPreview = null;
     this.hideMenu();
     this.updateCursorStyle();
     this.opts.onToolChange?.(tool);
@@ -204,6 +217,9 @@ export class Editor2D {
     this._raf = requestAnimationFrame(() => { this._raf = 0; this.render(); });
   }
 
+  /** True for the tools that draw an outline corner by corner (floor, cutout). */
+  isOutlineTool() { return this.tool === 'floor' || this.tool === 'cutout'; }
+
   // ---------------------------------------------------------------- snapping helpers
 
   nodeSnapRadius() { return Math.min(this.px(10), 30); }
@@ -249,6 +265,13 @@ export class Editor2D {
         }
       }
     }
+    if (this.selection?.kind === 'wall') {
+      const w = m.getWall(this.selection.id);
+      if (w && w.level === L) {
+        const mid = this.w2s(m.pointOnWall(w, m.wallLength(w) / 2));
+        if (dist(mid, screen) <= 8) return { kind: 'bulge', id: w.id };
+      }
+    }
     if (this.selection?.kind === 'floor') {
       const f = m.getFloor(this.selection.id);
       if (f) {
@@ -287,11 +310,15 @@ export class Editor2D {
       const st = m.stairs[i];
       if (st.level === L && pointInPolygon(p, m.stairsFootprint(st))) return { kind: 'stairs', id: st.id };
     }
-    for (let i = m.floors.length - 1; i >= 0; i--) {
-      const f = m.floors[i];
-      if (f.level !== L || !pointInPolygon(p, f.points)) continue;
-      if (m.floorHoles(f).some((h) => pointInPolygon(p, h))) continue; // in the stairwell
-      return { kind: 'floor', id: f.id };
+    // Cutouts first: they sit in the hole they make, where the slab underneath is not hit.
+    for (const wantCutout of [true, false]) {
+      for (let i = m.floors.length - 1; i >= 0; i--) {
+        const f = m.floors[i];
+        if (f.level !== L || (f.kind === 'cutout') !== wantCutout) continue;
+        if (!pointInPolygon(p, f.points)) continue;
+        if (!wantCutout && m.floorHoles(f).some((h) => pointInPolygon(p, h))) continue; // in a hole
+        return { kind: 'floor', id: f.id };
+      }
     }
     return null;
   }
@@ -312,7 +339,7 @@ export class Editor2D {
     c.addEventListener('pointermove', (e) => this.onPointerMove(e));
     c.addEventListener('pointerup', (e) => this.onPointerUp(e));
     c.addEventListener('pointercancel', (e) => this.onPointerUp(e, true));
-    c.addEventListener('pointerleave', () => { if (!this.drag) { this.cursor = null; this.hover = null; this.ghost = null; this.splitPreview = null; this.stairGhost = null; this.requestRender(); } });
+    c.addEventListener('pointerleave', () => { if (!this.drag) { this.cursor = null; this.hover = null; this.ghost = null; this.splitPreview = null; this.stairGhost = null; this.fillPreview = null; this.requestRender(); } });
     c.addEventListener('dblclick', (e) => this.onDoubleClick(e));
     c.addEventListener('wheel', (e) => {
       e.preventDefault();
@@ -377,6 +404,10 @@ export class Editor2D {
         this.startDrag(e, { kind: 'floorVertex', id: hit.id, index: hit.index });
         return;
       }
+      if (hit.kind === 'bulge') {
+        this.startDrag(e, { kind: 'bulge', id: hit.id });
+        return;
+      }
       this.setSelection({ kind: hit.kind, id: hit.id });
       if (hit.kind === 'node') this.startDrag(e, { kind: 'node', id: hit.id });
       else if (hit.kind === 'wall') {
@@ -396,8 +427,17 @@ export class Editor2D {
       return;
     }
 
-    if (this.tool === 'wall') { this.wallClick(p); return; }
-    if (this.tool === 'floor') { this.floorClick(p); return; }
+    if (this.tool === 'wall' || this.tool === 'curve') { this.wallClick(p); return; }
+    if (this.isOutlineTool()) { this.floorClick(p); return; }
+
+    if (this.tool === 'fill') {
+      const poly = this.model.roomPolygonAt(p);
+      if (!poly) { this.opts.onStatus?.('No closed room here. Walls must enclose the point.'); return; }
+      const f = this.model.addFloor(poly);
+      if (f) { this.commit(); this.setSelection({ kind: 'floor', id: f.id }); }
+      this.refreshPreview();
+      return;
+    }
 
     if (this.tool === 'stairs') {
       const q = this.snapDraw(p);
@@ -450,7 +490,9 @@ export class Editor2D {
     if (!this.cursorScreen) { this.requestRender(); return; }
     const p = this.cursor;
     this.hover = null; this.ghost = null; this.splitPreview = null; this.stairGhost = null;
+    this.fillPreview = null;
     if (this.tool === 'select') this.hover = this.hitTest(this.cursorScreen);
+    else if (this.tool === 'fill') this.fillPreview = this.model.roomPolygonAt(p);
     else if (TOOLS[this.tool].opening) this.ghost = this.computeGhost(p);
     else if (this.tool === 'stairs') this.stairGhost = this.snapDraw(p);
     else if (this.tool === 'split') {
@@ -505,6 +547,16 @@ export class Editor2D {
       case 'floorVertex': {
         const q = this.snapDraw(p);
         m.moveFloorVertex(d.id, d.index, q.x, q.y);
+        break;
+      }
+      case 'bulge': {
+        // The sagitta is how far the dragged point is off the chord, across it.
+        const w = m.getWall(d.id);
+        if (!w) break;
+        const { a, b } = m.wallEnds(w);
+        const u = m.wallDir(w);
+        const s = dot(sub(p, lerp(a, b, 0.5)), perp(u));
+        m.updateWall(d.id, { bulge: this.snapLen(s) });
         break;
       }
       case 'opening': this.dragOpening(d, p); break;
@@ -566,8 +618,8 @@ export class Editor2D {
 
   onDoubleClick(e) {
     this.updatePointer(e);
-    if (this.tool === 'wall') { this.endChain(); this.requestRender(); return; }
-    if (this.tool === 'floor') { this.finishFloor(); return; }
+    if (this.tool === 'wall' || this.tool === 'curve') { this.endChain(); this.requestRender(); return; }
+    if (this.isOutlineTool()) { this.finishFloor(); return; }
     if (this.tool !== 'select') return;
     const hit = this.hitTest(this.cursorScreen);
     if (hit?.kind === 'wall') {
@@ -579,10 +631,11 @@ export class Editor2D {
   onContextMenu(e) {
     e.preventDefault();
     this.updatePointer(e);
-    if (this.tool === 'wall' && this.chain) { this.endChain(); this.requestRender(); return; }
-    if (this.tool === 'floor' && this.floorDraw) { this.finishFloor(); return; }
+    if ((this.tool === 'wall' || this.tool === 'curve') && this.chain) { this.endChain(); this.requestRender(); return; }
+    if (this.isOutlineTool() && this.floorDraw) { this.finishFloor(); return; }
     let hit = this.hitTest(this.cursorScreen);
     if (hit?.kind === 'floorVertex') hit = { kind: 'floor', id: hit.id };
+    if (hit?.kind === 'bulge') hit = { kind: 'wall', id: hit.id };
     if (!hit || hit.kind === 'handle') { this.hideMenu(); return; }
     if (this.tool !== 'select') this.setTool('select');
     this.setSelection({ kind: hit.kind, id: hit.id });
@@ -595,10 +648,18 @@ export class Editor2D {
         if (res) { this.commit(); this.setSelection({ kind: 'node', id: res.node.id }); }
       } });
       items.push({ label: 'Split in half', action: () => this.splitSelectedInHalf() });
+      if (m.getWall(hit.id)?.bulge) {
+        items.push({ label: 'Straighten', action: () => { m.updateWall(hit.id, { bulge: 0 }); this.commit(); } });
+      }
     }
-    if (hit.kind === 'opening' && m.getOpening(hit.id)?.type === 'door') {
-      items.push({ label: 'Flip hinge', action: () => this.flipDoor(hit.id, 1) });
-      items.push({ label: 'Flip side', action: () => this.flipDoor(hit.id, 2) });
+    if (hit.kind === 'opening') {
+      const spec = openingSpec(m.getOpening(hit.id)?.type);
+      if (spec.kind === 'door') {
+        if (spec.style !== 'garage' && spec.leaves < 2) {
+          items.push({ label: spec.style === 'slide' ? 'Flip direction' : 'Flip hinge', action: () => this.flipDoor(hit.id, 1) });
+        }
+        items.push({ label: 'Flip side', action: () => this.flipDoor(hit.id, 2) });
+      }
     }
     if (hit.kind === 'stairs') items.push({ label: 'Rotate 90°', action: () => this.rotateStairs(hit.id) });
     items.push({ label: 'Delete', danger: true, action: () => this.deleteSelection() });
@@ -647,14 +708,24 @@ export class Editor2D {
     let p = this.snapDraw(raw);
     if (this.chain && this.keys.shift && !p.node) p = this.constrain(p, this.chain.last);
     if (!this.chain) {
-      this.chain = { start: { x: p.x, y: p.y }, last: { x: p.x, y: p.y }, count: 0 };
+      this.chain = { start: { x: p.x, y: p.y }, last: { x: p.x, y: p.y }, count: 0, pts: [{ x: p.x, y: p.y }], walls: [] };
       this.requestRender();
       return;
     }
     if (dist(p, this.chain.last) < 0.5) return; // second click of a double-click
     const r = Math.max(this.nodeSnapRadius(), 0.5);
     const level = this.model.getLevel(this.model.activeLevel);
-    const w = this.model.addWall(this.chain.last, p, { snapRadius: r, splitWalls: true, height: level?.height });
+    const curve = this.tool === 'curve';
+    const w = this.model.batch(() => {
+      const wall = this.model.addWall(this.chain.last, p, { snapRadius: r, splitWalls: true, height: level?.height });
+      if (wall && curve) {
+        const node = this.model.nodeNear(p, r);
+        this.chain.pts.push(node ? { x: node.x, y: node.y } : { x: p.x, y: p.y });
+        this.chain.walls.push(wall.id);
+        this.refitCurve();
+      }
+      return wall;
+    });
     if (!w) return;
     this.commit();
     const endNode = this.model.nodeNear(p, r);
@@ -663,6 +734,27 @@ export class Editor2D {
     if (this.chain.count >= 2 && dist(end, this.chain.start) < 0.5) { this.endChain(); }
     else this.chain.last = end;
     this.requestRender();
+  }
+
+  /**
+   * Bend every wall of the curve chain so the chain follows a Catmull-Rom spline through the
+   * points that were clicked. Each click refits the whole chain, so the walls always match the
+   * curve the preview drew.
+   */
+  refitCurve() {
+    const ch = this.chain;
+    if (!ch?.walls?.length) return;
+    const bulges = splineBulges(ch.pts);
+    this.model.batch(() => {
+      ch.walls.forEach((id, i) => {
+        const w = this.model.getWall(id);
+        if (!w || bulges[i] == null) return;
+        // The spline runs from pts[i] to pts[i+1]; the wall may store its nodes the other way.
+        const a = this.model.getNode(w.a);
+        const flipped = a && dist(a, ch.pts[i]) > dist(a, ch.pts[i + 1]);
+        this.model.updateWall(id, { bulge: flipped ? -bulges[i] : bulges[i] });
+      });
+    });
   }
 
   /** Shift: keep the segment from l to p horizontal or vertical. */
@@ -686,7 +778,7 @@ export class Editor2D {
   floorClick(raw) {
     const p = this.floorPoint(raw);
     if (!this.floorDraw) {
-      this.floorDraw = { points: [{ x: p.x, y: p.y }] };
+      this.floorDraw = { points: [{ x: p.x, y: p.y }], kind: this.tool === 'cutout' ? 'cutout' : 'slab' };
       this.requestRender();
       return;
     }
@@ -697,14 +789,21 @@ export class Editor2D {
     this.requestRender();
   }
 
-  /** Close the floor being drawn. Returns true if a floor drawing was in progress. */
+  /** Close the floor or cutout being drawn. Returns true if a drawing was in progress. */
   finishFloor() {
     const fd = this.floorDraw;
     if (!fd) return false;
     this.floorDraw = null;
-    const f = fd.points.length >= 3 ? this.model.addFloor(fd.points) : null;
-    if (f) { this.commit(); this.setSelection({ kind: 'floor', id: f.id }); }
-    else if (fd.points.length > 1) this.opts.onStatus?.('A floor needs at least 3 corners and some area.');
+    const f = fd.points.length >= 3 ? this.model.addFloor(fd.points, { kind: fd.kind }) : null;
+    if (f) {
+      this.commit();
+      this.setSelection({ kind: 'floor', id: f.id });
+      if (f.kind === 'cutout' && !this.model.floorsCutBy(f).length) {
+        this.opts.onStatus?.('This cutout is not inside a floor on this level, so it cuts nothing yet.');
+      }
+    } else if (fd.points.length > 1) {
+      this.opts.onStatus?.(`A ${fd.kind === 'cutout' ? 'cutout' : 'floor'} needs at least 3 corners and some area.`);
+    }
     this.requestRender();
     return true;
   }
@@ -760,13 +859,15 @@ export class Editor2D {
         ? (this.ghost.wallId ? 'No room on this wall.' : 'Move near a wall to place it.')
         : `Click to place a ${tool.label.toLowerCase()} on the wall. Esc returns to Select.`;
     }
-    if (this.tool === 'floor' && this.floorDraw) {
+    if (this.tool === 'fill' && !this.fillPreview && this.cursor) hint = 'No closed room here. Click inside walls that enclose a space.';
+    if (this.isOutlineTool() && this.floorDraw) {
       const pts = this.floorDraw.points;
       hint = pts.length >= 3
         ? `${pts.length} corners. Click the first corner, double-click or press Enter to close. Esc cancels.`
         : `${pts.length} corner${pts.length === 1 ? '' : 's'}. Keep clicking to add corners. Esc cancels.`;
     }
-    if (this.drag?.kind === 'handle') hint = 'Drag to resize. Shift anchors the opposite edge. Alt disables snapping.';
+    if (this.drag?.kind === 'bulge') hint = 'Drag to bend the wall; drop it back on the chord to straighten it. Alt disables snapping.';
+    else if (this.drag?.kind === 'handle') hint = 'Drag to resize. Shift anchors the opposite edge. Alt disables snapping.';
     else if (this.drag?.kind === 'floorVertex') hint = 'Drag the corner. It snaps to wall corners and the grid; Alt disables snapping.';
     else if (this.drag?.kind === 'opening') hint = 'Slide along the wall, or move close to another wall to jump onto it.';
     if (hint) parts.push(hint);
@@ -806,7 +907,8 @@ export class Editor2D {
     if (below) this.drawLevelGhost(below.id);
 
     // Floors are opaque, so they cover the level below wherever this level has a floor.
-    for (const f of m.floors) if (f.level === L) this.drawFloor(f, state('floor', f.id));
+    for (const f of m.floors) if (f.level === L && f.kind !== 'cutout') this.drawFloor(f, state('floor', f.id));
+    for (const f of m.floors) if (f.level === L && f.kind === 'cutout') this.drawFloor(f, state('floor', f.id));
     for (const st of m.stairs) if (st.level === L) this.drawStairs(st, state('stairs', st.id));
 
     const walls = m.walls.filter((w) => w.level === L);
@@ -816,10 +918,8 @@ export class Editor2D {
     for (const w of walls) {
       const pg = polys.get(w.id);
       if (!pg) continue;
-      const pts = [pg.aPlus, pg.bPlus, pg.bMinus, pg.aMinus].map((q) => this.w2s(q));
       ctx.beginPath();
-      pts.forEach((q, i) => (i ? ctx.lineTo(q.x, q.y) : ctx.moveTo(q.x, q.y)));
-      ctx.closePath();
+      this.traceWall(w, pg);
       ctx.fillStyle = isSel('wall', w.id) ? this.c.accent : isHov('wall', w.id) ? this.c.wallHover : this.c.wall;
       ctx.fill();
     }
@@ -827,10 +927,12 @@ export class Editor2D {
     ctx.strokeStyle = this.c.wallEdge;
     for (const w of walls) {
       const pg = polys.get(w.id);
-      const [ap, bp, bm, am] = [pg.aPlus, pg.bPlus, pg.bMinus, pg.aMinus].map((q) => this.w2s(q));
+      if (!pg) continue;
+      const ap = this.w2s(pg.aPlus), am = this.w2s(pg.aMinus);
+      const bp = this.w2s(pg.bPlus), bm = this.w2s(pg.bMinus);
       ctx.beginPath();
-      ctx.moveTo(ap.x, ap.y); ctx.lineTo(bp.x, bp.y);
-      ctx.moveTo(am.x, am.y); ctx.lineTo(bm.x, bm.y);
+      ctx.moveTo(ap.x, ap.y); this.traceWallSide(w, pg, true, true);
+      ctx.moveTo(am.x, am.y); this.traceWallSide(w, pg, false, true);
       if (m.wallsAtNode(w.a).length === 1) { ctx.moveTo(ap.x, ap.y); ctx.lineTo(am.x, am.y); }
       if (m.wallsAtNode(w.b).length === 1) { ctx.moveTo(bp.x, bp.y); ctx.lineTo(bm.x, bm.y); }
       ctx.stroke();
@@ -846,7 +948,7 @@ export class Editor2D {
     for (const w of walls) this.drawWallLength(w, polys.get(w.id), isSel('wall', w.id));
 
     // Nodes: shown for the selection, hover, and in drawing tools as snap targets.
-    const showAllNodes = this.tool === 'wall' || this.tool === 'select';
+    const showAllNodes = this.tool === 'wall' || this.tool === 'curve' || this.tool === 'select';
     for (const n of m.nodes) {
       if (n.level !== L) continue;
       const s = this.w2s(n);
@@ -882,9 +984,25 @@ export class Editor2D {
         }
         const w = m.getWall(o.wallId);
         const pos = this.w2s(m.pointOnWall(w, o.t));
-        const n = perp(m.wallDir(w));
+        const n = perp(m.wallDirAt(w, o.t));
         const off = w.thickness / 2 * this.scale + 16;
         this.pill(`${round(o.width)} cm`, pos.x - n.x * off, pos.y - n.y * off, true);
+      }
+    }
+
+    // The handle that bends the selected wall, at the middle of its centre line.
+    if (sel?.kind === 'wall') {
+      const w = m.getWall(sel.id);
+      if (w && w.level === L) {
+        const c0 = this.w2s(m.pointOnWall(w, m.wallLength(w) / 2));
+        const hot = hov?.kind === 'bulge' && hov.id === w.id;
+        ctx.beginPath();
+        ctx.arc(c0.x, c0.y, 5.5, 0, Math.PI * 2);
+        ctx.fillStyle = hot ? this.c.accent : '#ffffff';
+        ctx.fill();
+        ctx.lineWidth = 2;
+        ctx.strokeStyle = this.c.accent;
+        ctx.stroke();
       }
     }
 
@@ -905,8 +1023,11 @@ export class Editor2D {
     }
 
     // Tool previews.
-    if (this.tool === 'wall') this.drawWallPreview();
-    if (this.tool === 'floor') this.drawFloorPreview();
+    if (this.tool === 'wall' || this.tool === 'curve') this.drawWallPreview();
+    if (this.isOutlineTool()) this.drawFloorPreview();
+    if (this.fillPreview) {
+      this.poly(this.fillPreview.map((q) => this.w2s(q)), this.c.accentSoft, this.c.accent, 1.5);
+    }
     if (this.stairGhost) {
       this.drawStairs({ ...STAIR_DEFAULTS, x: this.stairGhost.x, y: this.stairGhost.y, angle: 0, level: L }, 'ghost');
     }
@@ -933,7 +1054,11 @@ export class Editor2D {
     const polys = computeWallPolygons(m, level);
     for (const w of m.walls) {
       const pg = polys.get(w.id);
-      if (pg) this.poly([pg.aPlus, pg.bPlus, pg.bMinus, pg.aMinus].map((q) => this.w2s(q)), this.c.wall);
+      if (!pg) continue;
+      ctx.beginPath();
+      this.traceWall(w, pg);
+      ctx.fillStyle = this.c.wall;
+      ctx.fill();
     }
     for (const o of m.openings) {
       const w = m.getWall(o.wallId);
@@ -949,11 +1074,24 @@ export class Editor2D {
     ctx.closePath();
   }
 
-  /** Floor slab: opaque fill with stairwell holes cut out (even-odd). state: null | 'hover' | 'selected'. */
+  /**
+   * Floor slab: opaque fill with stairwell and cutout holes removed (even-odd). A cutout itself is
+   * drawn as a dashed outline only, so the hole it makes stays visible.
+   * state: null | 'hover' | 'selected'.
+   */
   drawFloor(f, state) {
     const ctx = this.ctx;
     ctx.beginPath();
     this.tracePolygon(f.points);
+    if (f.kind === 'cutout') {
+      ctx.save();
+      ctx.setLineDash([7, 5]);
+      ctx.strokeStyle = state ? this.c.accent : this.c.label;
+      ctx.lineWidth = state === 'selected' ? 2 : 1;
+      ctx.stroke();
+      ctx.restore();
+      return;
+    }
     for (const h of this.model.floorHoles(f)) this.tracePolygon(h);
     ctx.fillStyle = this.c.floor;
     ctx.fill('evenodd');
@@ -1073,13 +1211,87 @@ export class Editor2D {
     }
   }
 
-  /** Screen-space quad along a wall between offsets s0..s1 (along) and k0..k1 (across, cm). */
-  wallQuad(w, s0, s1, k0, k1) {
+  /**
+   * World point `s` cm along the wall from node a, offset `k` cm across it (+k on the
+   * perp(tangent) side). Curved walls follow their arc, so every opening symbol built from this
+   * bends with the wall.
+   */
+  wallPoint(w, s, k) {
     const m = this.model;
-    const u = m.wallDir(w), n = perp(u);
-    const { a } = m.wallEnds(w);
-    const P = (s, k) => this.w2s(add(add(a, scale(u, s)), scale(n, k)));
-    return [P(s0, k0), P(s1, k0), P(s1, k1), P(s0, k1)];
+    const L = m.wallLength(w);
+    const p = m.pointOnWall(w, clamp(s, 0, L));
+    return k ? add(p, scale(perp(m.wallDirAt(w, clamp(s, 0, L))), k)) : p;
+  }
+
+  wallScreen(w, s, k) { return this.w2s(this.wallPoint(w, s, k)); }
+
+  /** Screen points following the wall from s0 to s1 at cross-offset k (sampled when it curves). */
+  samplesAlong(w, s0, s1, k) {
+    if (!w.bulge) return [this.wallScreen(w, s0, k), this.wallScreen(w, s1, k)];
+    const n = Math.max(1, Math.ceil(Math.abs(s1 - s0) / 8));
+    const out = [];
+    for (let i = 0; i <= n; i++) out.push(this.wallScreen(w, s0 + ((s1 - s0) * i) / n, k));
+    return out;
+  }
+
+  /** Stroke a line that follows the wall from s0 to s1 at cross-offset k. */
+  strokeAlong(w, s0, s1, k, color, width = 1) {
+    const ctx = this.ctx;
+    const pts = this.samplesAlong(w, s0, s1, k);
+    ctx.beginPath();
+    pts.forEach((q, i) => (i ? ctx.lineTo(q.x, q.y) : ctx.moveTo(q.x, q.y)));
+    ctx.strokeStyle = color;
+    ctx.lineWidth = width;
+    ctx.stroke();
+  }
+
+  /** Screen-space band along a wall between offsets s0..s1 (along) and k0..k1 (across, cm). */
+  wallQuad(w, s0, s1, k0, k1) {
+    return [...this.samplesAlong(w, s0, s1, k0), ...this.samplesAlong(w, s1, s0, k1)];
+  }
+
+  /**
+   * Add one side of a wall to the current path, from the mitred corner at one end to the corner at
+   * the other: a straight line, or the concentric arc of a curved wall.
+   * plus: the perp(tangent) side. forward: from node a to node b.
+   */
+  traceWallSide(w, pg, plus, forward) {
+    const ctx = this.ctx;
+    const arc = pg.arc;
+    const ends = plus ? [pg.aPlus, pg.bPlus] : [pg.aMinus, pg.bMinus];
+    const [from, to] = forward ? ends : [ends[1], ends[0]];
+    if (!arc || !arc.curved) { const q = this.w2s(to); ctx.lineTo(q.x, q.y); return; }
+    const c = this.w2s(arc.centre);
+    const R = Math.max(0.01, arc.R - Math.sign(arc.sweep) * (plus ? w.thickness / 2 : -w.thickness / 2));
+    const ang = (q) => Math.atan2(q.y - arc.centre.y, q.x - arc.centre.x);
+    ctx.arc(c.x, c.y, R * this.scale, ang(from), ang(to), forward ? arc.sweep < 0 : arc.sweep > 0);
+  }
+
+  /** Trace a wall's outline (both mitred ends joined by its two side edges) into the current path. */
+  traceWall(w, pg) {
+    const ctx = this.ctx;
+    const start = this.w2s(pg.aPlus), corner = this.w2s(pg.bMinus);
+    ctx.moveTo(start.x, start.y);
+    this.traceWallSide(w, pg, true, true);
+    ctx.lineTo(corner.x, corner.y);
+    this.traceWallSide(w, pg, false, false);
+    ctx.closePath();
+  }
+
+  /** Dashed circular arc (world centre and radius, screen-space stroke). */
+  dashedArc(centre, r, a0, da, color) {
+    const ctx = this.ctx;
+    ctx.beginPath();
+    const steps = Math.max(8, Math.min(48, Math.ceil(Math.abs(da) / 0.12)));
+    for (let i = 0; i <= steps; i++) {
+      const ang = a0 + (da * i) / steps;
+      const q = this.w2s({ x: centre.x + Math.cos(ang) * r, y: centre.y + Math.sin(ang) * r });
+      if (i) ctx.lineTo(q.x, q.y); else ctx.moveTo(q.x, q.y);
+    }
+    ctx.setLineDash([4, 3]);
+    ctx.strokeStyle = color; ctx.lineWidth = 1;
+    ctx.stroke();
+    ctx.setLineDash([]);
   }
 
   poly(pts, fill, stroke, lineWidth = 1) {
@@ -1102,75 +1314,109 @@ export class Editor2D {
   /** Draw an opening as a gap in the wall plus its symbol. state: null | 'hover' | 'selected' | 'ghost' | 'invalid'. */
   drawOpening(w, type, t, width, swing, state) {
     const m = this.model;
-    const ctx = this.ctx;
     const L = m.wallLength(w);
+    const spec = openingSpec(type);
     const s0 = clamp(t - width / 2, 0, L), s1 = clamp(t + width / 2, 0, L);
     const h = w.thickness / 2;
     const pad = this.px(0.75);
-    const kind = OPENING_TYPES[type].kind;
     const ghost = state === 'ghost' || state === 'invalid';
     const accent = state === 'invalid' ? this.c.invalid : this.c.accent;
     const edge = state ? accent : this.c.wallEdge;
 
-    if (!ghost) this.poly(this.wallQuad(w, s0, s1, -h - pad, h + pad), this.c.bg);
-    else this.poly(this.wallQuad(w, s0, s1, -h - pad, h + pad), state === 'invalid' ? 'rgba(220,38,38,0.18)' : this.c.accentSoft);
+    // The gap in the wall.
+    this.poly(this.wallQuad(w, s0, s1, -h - pad, h + pad),
+      !ghost ? this.c.bg : state === 'invalid' ? 'rgba(220,38,38,0.18)' : this.c.accentSoft);
 
     // Jambs.
-    const j0 = this.wallQuad(w, s0, s0, -h, h), j1 = this.wallQuad(w, s1, s1, -h, h);
-    this.line(j0[0], j0[3], edge, state ? 2 : 1.25);
-    this.line(j1[0], j1[3], edge, state ? 2 : 1.25);
+    this.line(this.wallScreen(w, s0, -h), this.wallScreen(w, s0, h), edge, state ? 2 : 1.25);
+    this.line(this.wallScreen(w, s1, -h), this.wallScreen(w, s1, h), edge, state ? 2 : 1.25);
 
-    if (kind === 'door') {
-      const hingeAtEnd = (swing & 1) === 1;
-      const side = (swing & 2) ? -1 : 1;
-      const sh = hingeAtEnd ? s1 : s0, so = hingeAtEnd ? s0 : s1;
-      const u = m.wallDir(w), n = perp(u);
-      const { a } = m.wallEnds(w);
-      const P = (s, k) => add(add(a, scale(u, s)), scale(n, k));
-      const H = P(sh, side * h);
-      const tip = add(H, scale(n, side * (s1 - s0)));
-      const O = P(so, side * h);
-      const color = state ? accent : this.c.door;
-      this.line(this.w2s(H), this.w2s(tip), color, 2);
-      // Swing arc from the leaf tip to the opposite jamb.
-      const a0 = angleOf(sub(tip, H));
-      let da = angleOf(sub(O, H)) - a0;
-      while (da > Math.PI) da -= 2 * Math.PI;
-      while (da < -Math.PI) da += 2 * Math.PI;
-      const r = s1 - s0;
-      ctx.beginPath();
-      for (let i = 0; i <= 24; i++) {
-        const ang = a0 + (da * i) / 24;
-        const q = this.w2s({ x: H.x + Math.cos(ang) * r, y: H.y + Math.sin(ang) * r });
-        if (i) ctx.lineTo(q.x, q.y); else ctx.moveTo(q.x, q.y);
-      }
-      ctx.setLineDash([4, 3]);
-      ctx.strokeStyle = color; ctx.lineWidth = 1;
-      ctx.stroke();
-      ctx.setLineDash([]);
-      // Threshold line.
-      const th = this.wallQuad(w, s0, s1, 0, 0);
-      this.line(th[0], th[1], color, 1);
-    } else {
-      const g = h * 0.4;
-      const glassEdge = state ? accent : this.c.glassEdge;
-      if (type === 'window_full') this.poly(this.wallQuad(w, s0, s1, -h, h), ghost ? null : this.c.glass);
-      else this.poly(this.wallQuad(w, s0, s1, -g, g), ghost ? null : this.c.glass);
-      const q1 = this.wallQuad(w, s0, s1, -g, g);
-      this.line(q1[0], q1[1], glassEdge, 1.25);
-      this.line(q1[3], q1[2], glassEdge, 1.25);
-      if (type !== 'window') {
-        const c = this.wallQuad(w, s0, s1, 0, 0);
-        this.line(c[0], c[1], glassEdge, 1);
-      }
-      if (type === 'window_full') {
-        const outer = this.wallQuad(w, s0, s1, -h, h);
-        this.line(outer[0], outer[1], glassEdge, 1);
-        this.line(outer[3], outer[2], glassEdge, 1);
-      }
-    }
+    if (spec.kind === 'door') this.drawDoorSymbol(w, spec, s0, s1, swing, state ? accent : this.c.door);
+    else this.drawWindowSymbol(w, spec, s0, s1, h, ghost, state ? accent : this.c.glassEdge);
+
     if (state === 'selected' || state === 'hover') {
       this.poly(this.wallQuad(w, s0, s1, -h - this.px(2), h + this.px(2)), null, accent, state === 'selected' ? 2 : 1);
+    }
+  }
+
+  /** Swinging, sliding or sectional door symbol. swing bit 1 = hinge / slide end, bit 2 = side. */
+  drawDoorSymbol(w, spec, s0, s1, swing, color) {
+    const h = w.thickness / 2;
+    const side = (swing & 2) ? -1 : 1;
+    const flip = (swing & 1) === 1;
+    if (spec.style === 'swing') {
+      if (spec.leaves >= 2) {
+        const mid = (s0 + s1) / 2;
+        this.drawLeaf(w, s0, mid, side, color);
+        this.drawLeaf(w, s1, mid, side, color);
+      } else {
+        this.drawLeaf(w, flip ? s1 : s0, flip ? s0 : s1, side, color);
+      }
+      this.strokeAlong(w, s0, s1, 0, color, 1); // threshold
+      return;
+    }
+    if (spec.style === 'slide') {
+      // Leaf parked over the opening on `side`, with the track it slides along and an arrow.
+      const k = side * h * 0.55, tk = Math.max(h * 0.3, this.px(1.5));
+      this.poly(this.wallQuad(w, s0 + 1, s1 - 1, k - tk / 2, k + tk / 2), color);
+      const L = this.model.wallLength(w);
+      const reach = s1 - s0;
+      const end = clamp(flip ? s0 - reach : s1 + reach, 0, L);
+      const ctx = this.ctx;
+      ctx.setLineDash([5, 4]);
+      this.line(this.wallScreen(w, flip ? s1 : s0, k), this.wallScreen(w, end, k), color, 1);
+      ctx.setLineDash([]);
+      const tipS = clamp(flip ? end + 2 : end - 2, 0, L);
+      const tip = this.wallScreen(w, end, k);
+      for (const off of [-tk, tk]) this.line(tip, this.wallScreen(w, tipS, k + off), color, 1);
+      return;
+    }
+    // Garage: a sectional panel across the wall, with travel rails reaching into the room.
+    const panels = Math.max(2, Math.round((s1 - s0) / 60));
+    for (let i = 0; i <= panels; i++) {
+      const s = s0 + ((s1 - s0) * i) / panels;
+      this.line(this.wallScreen(w, s, -h), this.wallScreen(w, s, h), color, i === 0 || i === panels ? 1.5 : 0.75);
+    }
+    const rail = Math.min(70, (s1 - s0) / 2);
+    const ctx = this.ctx;
+    ctx.setLineDash([6, 4]);
+    for (const s of [s0 + 1, s1 - 1]) {
+      const base = this.wallPoint(w, s, side * h);
+      const n = perp(this.model.wallDirAt(w, s));
+      this.line(this.w2s(base), this.w2s(add(base, scale(n, side * rail))), color, 1);
+    }
+    ctx.setLineDash([]);
+  }
+
+  /** One door leaf hinged at `sh` opening towards `so` on the `side` face, plus its swing arc. */
+  drawLeaf(w, sh, so, side, color) {
+    const h = w.thickness / 2;
+    const r = Math.abs(so - sh);
+    if (r < 0.5) return;
+    const H = this.wallPoint(w, sh, side * h);
+    const n = perp(this.model.wallDirAt(w, sh));
+    const tip = add(H, scale(n, side * r));
+    const O = this.wallPoint(w, so, side * h);
+    this.line(this.w2s(H), this.w2s(tip), color, 2);
+    const a0 = angleOf(sub(tip, H));
+    let da = angleOf(sub(O, H)) - a0;
+    while (da > Math.PI) da -= 2 * Math.PI;
+    while (da < -Math.PI) da += 2 * Math.PI;
+    this.dashedArc(H, r, a0, da, color);
+  }
+
+  /** Window symbol: a glass band with one mullion per pane division. */
+  drawWindowSymbol(w, spec, s0, s1, h, ghost, glassEdge) {
+    const full = spec.height == null;
+    const g = full ? h : h * 0.4;
+    if (!ghost) this.poly(this.wallQuad(w, s0, s1, -g, g), this.c.glass);
+    this.strokeAlong(w, s0, s1, -g, glassEdge, 1.25);
+    this.strokeAlong(w, s0, s1, g, glassEdge, 1.25);
+    // Tall glazing reads better with a line along the middle of the band.
+    if (full || spec.height >= 200) this.strokeAlong(w, s0, s1, 0, glassEdge, 1);
+    for (let i = 1; i < spec.panes; i++) {
+      const s = s0 + ((s1 - s0) * i) / spec.panes;
+      this.line(this.wallScreen(w, s, -g), this.wallScreen(w, s, g), glassEdge, 1.25);
     }
   }
 
@@ -1180,7 +1426,7 @@ export class Editor2D {
     const L = m.wallLength(w);
     if (!force && L * this.scale < 80) return;
     const mid = this.w2s(m.pointOnWall(w, L / 2));
-    const n = perp(m.wallDir(w));
+    const n = perp(m.wallDirAt(w, L / 2));
     const off = w.thickness / 2 * this.scale + 11;
     // Put the label on the outer (-n) side.
     this.pill(`${round(L)} cm`, mid.x - n.x * off, mid.y - n.y * off, force, angleOf(m.wallDir(w)));
@@ -1214,14 +1460,17 @@ export class Editor2D {
     const sp = this.w2s(p);
     if (this.chain) {
       const a = this.chain.last;
-      const L = dist(a, p);
-      if (L > EPS) {
-        const u = scale(sub(p, a), 1 / L), n = perp(u);
+      if (dist(a, p) > EPS) {
+        const bulge = this.tool === 'curve' ? (splineBulges([...this.chain.pts, p]).pop() || 0) : 0;
+        const arc = arcFromChord(a, p, bulge);
         const h = 7.5;
-        const pts = [add(a, scale(n, h)), add(p, scale(n, h)), add(p, scale(n, -h)), add(a, scale(n, -h))].map((q) => this.w2s(q));
-        this.poly(pts, this.c.accentSoft, this.c.accent, 1);
-        const mid = this.w2s({ x: (a.x + p.x) / 2, y: (a.y + p.y) / 2 });
-        this.pill(`${round(L)} cm`, mid.x - n.x * (h * this.scale + 14), mid.y - n.y * (h * this.scale + 14), true, angleOf(u));
+        const plus = arcSamples(arcOffset(arc, h)).map((q) => this.w2s(q));
+        const minus = arcSamples(arcOffset(arc, -h)).map((q) => this.w2s(q));
+        this.poly([...plus, ...minus.reverse()], this.c.accentSoft, this.c.accent, 1);
+        const at = arcPointAt(arc, arc.length / 2);
+        const mid = this.w2s(at.point);
+        const n = perp(at.tangent);
+        this.pill(`${round(arc.length)} cm`, mid.x - n.x * (h * this.scale + 14), mid.y - n.y * (h * this.scale + 14), true, angleOf(at.tangent));
       }
     }
     // Snap indicator.
@@ -1255,8 +1504,7 @@ export class Editor2D {
     const w = this.model.getWall(sp.wallId);
     if (!w) return;
     const h = w.thickness / 2 + this.px(6);
-    const q = this.wallQuad(w, sp.along, sp.along, -h, h);
-    this.line(q[0], q[3], this.c.accent, 2.5);
+    this.line(this.wallScreen(w, sp.along, -h), this.wallScreen(w, sp.along, h), this.c.accent, 2.5);
     const c = this.w2s(this.model.pointOnWall(w, sp.along));
     const L = this.model.wallLength(w);
     this.pill(`${round(sp.along)} | ${round(L - sp.along)} cm`, c.x, c.y - h * this.scale - 14, true);

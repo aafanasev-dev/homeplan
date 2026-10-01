@@ -2,7 +2,7 @@
 
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
-import { openingDims, OPENING_TYPES } from './catalog.js';
+import { openingDims, openingSpec } from './catalog.js';
 
 const FRAME = 5;       // window / door frame width, cm
 const LEAF = 4;        // door leaf thickness, cm
@@ -10,6 +10,7 @@ const DOOR_OPEN = 65;  // degrees the door leaf is drawn open
 const FLOOR_LIFT = 0.5; // cm: floor slabs sit this far above their level so they don't z-fight the ground
 const GHOST_OPACITY = 0.18; // levels above the active one
 const LEVEL_ANIM_MS = 300;  // camera move when switching level
+const CURVE_STEP = 15;      // cm: how finely a curved wall is stepped into boxes
 
 export class View3D {
   constructor(container, model) {
@@ -219,11 +220,27 @@ export class View3D {
     this.needsRender = true;
   }
 
+  /** The openings of a wall as spans along it, with their vertical dimensions, in order. */
+  wallOpenings(w, L) {
+    return this.model.openingsOnWall(w.id)
+      .map((o) => ({ o, s0: Math.max(0, o.t - o.width / 2), s1: Math.min(L, o.t + o.width / 2), ...openingDims(o.type, w.height) }))
+      .filter((x) => x.s1 - x.s0 > 1)
+      .sort((p, q) => p.s0 - q.s0);
+  }
+
+  /** How far a wall reaches past a node, to fill the joint with its neighbours. */
+  wallExt(w, nodeId) {
+    const others = this.model.wallsAtNode(nodeId).filter((x) => x !== w);
+    return others.length ? Math.max(...others.map((x) => x.thickness / 2)) : 0;
+  }
+
   buildLevel(parent, level, mats) {
     const m = this.model;
     const sel = this.selection;
     for (const w of m.walls) {
       if (w.level !== level.id) continue;
+      const wallMat = sel?.kind === 'wall' && sel.id === w.id ? mats.wallSel : mats.wall;
+      if (w.bulge) { this.buildCurvedWall(parent, w, wallMat, mats); continue; }
       const { a, b } = m.wallEnds(w);
       const L = Math.hypot(b.x - a.x, b.y - a.y);
       if (L < 0.01) continue;
@@ -234,19 +251,9 @@ export class View3D {
       g.rotation.y = -angle;
       parent.add(g);
 
-      // Extend into joined corners by half the thickness of the neighbouring walls.
-      const ext = (nodeId) => {
-        const others = m.wallsAtNode(nodeId).filter((x) => x !== w);
-        return others.length ? Math.max(...others.map((x) => x.thickness / 2)) : 0;
-      };
-      const extA = ext(w.a), extB = ext(w.b);
+      const extA = this.wallExt(w, w.a), extB = this.wallExt(w, w.b);
       const T = w.thickness, H = w.height;
-      const wallMat = sel?.kind === 'wall' && sel.id === w.id ? mats.wallSel : mats.wall;
-
-      const ops = m.openingsOnWall(w.id)
-        .map((o) => ({ o, s0: Math.max(0, o.t - o.width / 2), s1: Math.min(L, o.t + o.width / 2), ...openingDims(o.type, H) }))
-        .filter((x) => x.s1 - x.s0 > 1)
-        .sort((p, q) => p.s0 - q.s0);
+      const ops = this.wallOpenings(w, L);
 
       let cursor = -extA;
       for (const op of ops) {
@@ -263,10 +270,58 @@ export class View3D {
       if (L + extB > cursor) this.box(g, cursor, L + extB, 0, H, T, wallMat);
     }
     for (const f of m.floors) {
-      if (f.level === level.id) this.addFloor(parent, f, sel?.kind === 'floor' && sel.id === f.id ? mats.wallSel : mats.floor);
+      // Cutouts are not built: they only act as holes in the slabs of their level (floorHoles).
+      if (f.level === level.id && f.kind !== 'cutout') {
+        this.addFloor(parent, f, sel?.kind === 'floor' && sel.id === f.id ? mats.wallSel : mats.floor);
+      }
     }
     for (const st of m.stairs) {
       if (st.level === level.id) this.addStairs(parent, st, sel?.kind === 'stairs' && sel.id === st.id ? mats.wallSel : mats.stairs);
+    }
+  }
+
+  /**
+   * A curved wall: short boxes stepped along the arc, each in its own tangent frame, with the
+   * openings left out of the solid the same way the straight builder does. Each opening's filler
+   * is a straight unit on the chord of its span, tangent at the middle of the opening.
+   */
+  buildCurvedWall(parent, w, wallMat, mats) {
+    const m = this.model;
+    const sel = this.selection;
+    const L = m.wallLength(w);
+    if (L < 0.01) return;
+    const T = w.thickness, H = w.height;
+    const ops = this.wallOpenings(w, L);
+    const steps = Math.max(1, Math.ceil(L / CURVE_STEP));
+    const frame = (along) => {
+      const g = new THREE.Group();
+      const p = m.pointOnWall(w, along), d = m.wallDirAt(w, along);
+      g.position.set(p.x, 0, p.y);
+      g.rotation.y = -Math.atan2(d.y, d.x);
+      parent.add(g);
+      return g;
+    };
+    for (let i = 0; i < steps; i++) {
+      const s0 = (L * i) / steps, s1 = (L * (i + 1)) / steps;
+      const mid = (s0 + s1) / 2;
+      // Boxes are as long as the arc they replace, so neighbours overlap instead of leaving gaps.
+      const half = (s1 - s0) / 2;
+      const g = frame(mid);
+      const op = ops.find((x) => mid > x.s0 && mid < x.s1);
+      if (!op) { this.box(g, -half, half, 0, H, T, wallMat); continue; }
+      if (op.sill > 0) this.box(g, -half, half, 0, op.sill, T, wallMat);
+      if (op.top < H) this.box(g, -half, half, op.top, H, T, wallMat);
+    }
+    // Fill the joints at both ends, along the end tangents.
+    const extA = this.wallExt(w, w.a), extB = this.wallExt(w, w.b);
+    if (extA > 0.01) this.box(frame(0), -extA, 0, 0, H, T, wallMat);
+    if (extB > 0.01) this.box(frame(L), 0, extB, 0, H, T, wallMat);
+    for (const op of ops) {
+      const mid = (op.s0 + op.s1) / 2;
+      const p0 = m.pointOnWall(w, op.s0), p1 = m.pointOnWall(w, op.s1);
+      const span = Math.hypot(p1.x - p0.x, p1.y - p0.y);
+      const selected = sel?.kind === 'opening' && sel.id === op.o.id;
+      this.addFiller(frame(mid), { ...op, s0: -span / 2, s1: span / 2 }, T, selected, mats);
     }
   }
 
@@ -296,40 +351,86 @@ export class View3D {
     for (let i = 0; i < steps; i++) this.box(g, i * going, (i + 1) * going, 0, (i + 1) * riser, st.width, mat);
   }
 
+  /** What fills an opening: door leaves and frame, or window frame, mullions and glass. */
   addFiller(g, op, T, selected, mats = this.mats) {
+    const spec = openingSpec(op.o.type);
+    if (spec.kind === 'door') this.addDoorFiller(g, op, T, selected, mats, spec);
+    else this.addWindowFiller(g, op, T, selected, mats, spec);
+  }
+
+  addDoorFiller(g, op, T, selected, mats, spec) {
     const { o, s0, s1, sill, top } = op;
-    const kind = OPENING_TYPES[o.type].kind;
-    if (kind === 'door') {
-      const fm = selected ? mats.sel : mats.doorFrame;
-      const fw = Math.min(FRAME, (s1 - s0) / 4);
-      this.box(g, s0, s0 + fw, sill, top, T, fm);
-      this.box(g, s1 - fw, s1, sill, top, T, fm);
-      this.box(g, s0 + fw, s1 - fw, top - fw, top, T, fm);
-      const swing = o.swing || 0;
-      const hingeAtEnd = (swing & 1) === 1;
-      const side = (swing & 2) ? -1 : 1;
-      const leafW = s1 - s0 - 2 * fw;
-      const leafH = top - fw - sill - 1;
-      const pivot = new THREE.Group();
-      pivot.position.set(hingeAtEnd ? s1 - fw : s0 + fw, sill + 0.5, side * (T / 2 - LEAF / 2));
-      const hingeSign = hingeAtEnd ? -1 : 1;
-      pivot.rotation.y = -side * hingeSign * THREE.MathUtils.degToRad(DOOR_OPEN);
-      g.add(pivot);
-      this.box(pivot, hingeSign > 0 ? 0 : -leafW, hingeSign > 0 ? leafW : 0, 0, leafH, LEAF, selected ? mats.sel : mats.leaf);
-    } else {
-      const fm = selected ? mats.sel : mats.frame;
-      const fw = Math.min(FRAME, (s1 - s0) / 4, (top - sill) / 4);
-      this.box(g, s0, s0 + fw, sill, top, T, fm);
-      this.box(g, s1 - fw, s1, sill, top, T, fm);
-      this.box(g, s0 + fw, s1 - fw, sill, sill + fw, T, fm);
-      this.box(g, s0 + fw, s1 - fw, top - fw, top, T, fm);
-      if (o.type !== 'window' && s1 - s0 > 100) {
-        // Mullion in wide tall/full-height windows.
-        const mid = (s0 + s1) / 2;
-        this.box(g, mid - fw / 2, mid + fw / 2, sill + fw, top - fw, Math.min(T, 8), fm);
+    const fm = selected ? mats.sel : mats.doorFrame;
+    const leafMat = selected ? mats.sel : mats.leaf;
+    const fw = Math.min(FRAME, (s1 - s0) / 4);
+    const swing = o.swing || 0;
+    const flip = (swing & 1) === 1;
+    const side = (swing & 2) ? -1 : 1;
+
+    if (spec.style === 'garage') {
+      // Sectional panel closing the opening, drawn as stacked slats.
+      const slats = Math.max(2, Math.round((top - sill) / 50));
+      const gap = 1;
+      for (let i = 0; i < slats; i++) {
+        const y0 = sill + ((top - sill) * i) / slats;
+        const y1 = sill + ((top - sill) * (i + 1)) / slats - gap;
+        this.box(g, s0 + 1, s1 - 1, y0, y1, Math.min(T, 8), leafMat);
       }
-      this.box(g, s0 + fw, s1 - fw, sill + fw, top - fw, 1, mats.glass, 0, { shadow: false });
+      this.box(g, s0, s0 + fw, sill, top, T, fm);
+      this.box(g, s1 - fw, s1, sill, top, T, fm);
+      this.box(g, s0 + fw, s1 - fw, top - fw, top, T, fm);
+      return;
     }
+
+    this.box(g, s0, s0 + fw, sill, top, T, fm);
+    this.box(g, s1 - fw, s1, sill, top, T, fm);
+    this.box(g, s0 + fw, s1 - fw, top - fw, top, T, fm);
+
+    if (spec.style === 'slide') {
+      // Surface-mounted slider: the leaf hangs outside the wall face and is parked to one side.
+      const leafW = s1 - s0;
+      const leafH = top - fw - sill - 1;
+      const shift = leafW * 0.85 * (flip ? -1 : 1);
+      const z = side * (T / 2 + LEAF);
+      this.box(g, s0 + shift, s0 + shift + leafW, sill + 0.5, sill + 0.5 + leafH, LEAF, leafMat, z);
+      // Track above the opening, long enough for the leaf to slide along.
+      const t0 = Math.min(s0, s0 + shift) - fw, t1 = Math.max(s1, s1 + shift) + fw;
+      this.box(g, t0, t1, top, top + Math.min(fw, 4), LEAF, fm, z);
+      return;
+    }
+
+    // Swinging leaves: one, or two hinged at opposite jambs.
+    const leaves = spec.leaves >= 2 ? 2 : 1;
+    const leafH = top - fw - sill - 1;
+    const span = s1 - s0 - 2 * fw;
+    const leafW = span / leaves;
+    const hinges = leaves === 2
+      ? [{ s: s0 + fw, sign: 1 }, { s: s1 - fw, sign: -1 }]
+      : [{ s: flip ? s1 - fw : s0 + fw, sign: flip ? -1 : 1 }];
+    for (const hinge of hinges) {
+      const pivot = new THREE.Group();
+      pivot.position.set(hinge.s, sill + 0.5, side * (T / 2 - LEAF / 2));
+      pivot.rotation.y = -side * hinge.sign * THREE.MathUtils.degToRad(DOOR_OPEN);
+      g.add(pivot);
+      this.box(pivot, hinge.sign > 0 ? 0 : -leafW, hinge.sign > 0 ? leafW : 0, 0, leafH, LEAF, leafMat);
+    }
+  }
+
+  addWindowFiller(g, op, T, selected, mats, spec) {
+    const { s0, s1, sill, top } = op;
+    const fm = selected ? mats.sel : mats.frame;
+    const fw = Math.min(FRAME, (s1 - s0) / 4, (top - sill) / 4);
+    this.box(g, s0, s0 + fw, sill, top, T, fm);
+    this.box(g, s1 - fw, s1, sill, top, T, fm);
+    this.box(g, s0 + fw, s1 - fw, sill, sill + fw, T, fm);
+    this.box(g, s0 + fw, s1 - fw, top - fw, top, T, fm);
+    // One mullion per pane division, plus one in a wide single-pane sash so it does not look bare.
+    const panes = spec.panes > 1 ? spec.panes : (spec.height == null && s1 - s0 > 100 ? 2 : 1);
+    for (let i = 1; i < panes; i++) {
+      const mid = s0 + ((s1 - s0) * i) / panes;
+      this.box(g, mid - fw / 2, mid + fw / 2, sill + fw, top - fw, Math.min(T, 8), fm);
+    }
+    this.box(g, s0 + fw, s1 - fw, sill + fw, top - fw, 1, mats.glass, 0, { shadow: false });
   }
 
   /** Sun and shadow camera sized to every level. */

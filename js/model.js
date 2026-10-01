@@ -4,10 +4,15 @@
 //
 //   levels:   { id, name, height }  ordered bottom to top; elevations are computed (levelElevation)
 //   nodes:    { id, x, y, level }
-//   walls:    { id, a: nodeId, b: nodeId, thickness, height, level }  both nodes are on `level`
+//   walls:    { id, a: nodeId, b: nodeId, thickness, height, level, bulge? }  both nodes are on `level`
+//             bulge is the sagitta of a curved wall in cm: how far the middle of the arc sits off
+//             the middle of the chord, along perp(unit(b - a)). Absent or 0 means a straight wall,
+//             and openings measure `t` along the arc, so nothing else has to know the difference.
 //   openings: { id, wallId, type, t /* centre offset along wall, cm from node a */, width, swing? }
 //             openings take their level from their wall
-//   floors:   { id, level, points: [{x,y}], thickness }  slab spans elevation - thickness .. elevation
+//   floors:   { id, level, kind: 'slab' | 'cutout', points: [{x,y}], thickness }
+//             a slab spans elevation - thickness .. elevation; a cutout is a hole punched in the
+//             slabs of its own level (it is never built, in 2D or in 3D)
 //   stairs:   { id, level, x, y, width, length, angle }  (x, y) is the start of the flight's centre
 //             line; it runs `length` cm in direction `angle` (degrees, 0/90/180/270) up to the next level
 //
@@ -15,11 +20,13 @@
 // so undo snapshots never record level switches.
 
 import {
-  sub, add, scale, dist, perp, normalize, projectOnSegment, lineIntersect, angleOf, snap, clamp,
+  sub, add, scale, dist, perp, normalize, lineIntersect, angleOf, snap, clamp,
   polygonArea, pointInPolygon, distToSegment, EPS,
+  arcFromChord, arcPointAt, arcProject, arcSamples, arcOffset, bulgeFromSweep, ARC_SAMPLE,
 } from './geometry.js';
 import {
   WALL_DEFAULTS, FLOOR_DEFAULTS, STAIR_DEFAULTS, MIN_OPENING_WIDTH, OPENING_TYPES, isOpeningType,
+  openingSpec,
 } from './catalog.js';
 
 export const NODE_SNAP_RADIUS = 10; // cm
@@ -170,12 +177,16 @@ export class Model {
       const na = nodeById.get(a), nb = nodeById.get(b);
       if (!na || !nb || a === b || na.level !== nb.level) continue;
       ids.add(String(w.id));
-      walls.push({
+      const wall = {
         id: String(w.id), a, b,
         thickness: clamp(num(w.thickness, WALL_DEFAULTS.thickness), 1, 200),
         height: clamp(num(w.height, WALL_DEFAULTS.height), 10, 2000),
         level: na.level,
-      });
+      };
+      const chord = dist(na, nb);
+      const bulge = clamp(num(w.bulge, 0), -chord, chord);
+      if (Math.abs(bulge) >= 1e-4) wall.bulge = bulge;
+      walls.push(wall);
     }
     const wallIds = new Set(walls.map((w) => w.id));
     for (const o of list(d.openings)) {
@@ -197,7 +208,7 @@ export class Model {
       if (!level || !points) continue;
       ids.add(String(f.id));
       floors.push({
-        id: String(f.id), level, points,
+        id: String(f.id), level, kind: f.kind === 'cutout' ? 'cutout' : 'slab', points,
         thickness: clamp(num(f.thickness, FLOOR_DEFAULTS.thickness), 1, 200),
       });
     }
@@ -268,27 +279,42 @@ export class Model {
     return { a: this.getNode(w.a), b: this.getNode(w.b) };
   }
 
-  wallLength(w) {
+  /** The wall's centre line as an arc record (straight when it has no bulge). */
+  wallArc(w) {
+    w = this._wall(w);
     const { a, b } = this.wallEnds(w);
-    return dist(a, b);
+    return arcFromChord(a, b, w.bulge || 0);
   }
 
-  /** Unit direction from node a to node b. */
+  /** Length of the centre line: the chord for a straight wall, the arc length for a curved one. */
+  wallLength(w) {
+    return this.wallArc(w).length;
+  }
+
+  /** Unit direction of the chord, from node a to node b. */
   wallDir(w) {
     const { a, b } = this.wallEnds(w);
     return normalize(sub(b, a));
   }
 
-  /** Point `along` cm from node a, on the wall's centre line. */
-  pointOnWall(w, along) {
-    const { a } = this.wallEnds(w);
-    return add(a, scale(this.wallDir(w), along));
+  /** Unit tangent of the wall `along` cm from node a. A straight wall has one tangent everywhere. */
+  wallDirAt(w, along) {
+    return arcPointAt(this.wallArc(w), along).tangent;
   }
 
-  /** Projection of p onto wall w (see geometry.projectOnSegment). */
+  /** Point `along` cm from node a, on the wall's centre line. */
+  pointOnWall(w, along) {
+    return arcPointAt(this.wallArc(w), along).point;
+  }
+
+  /** Projection of p onto wall w (see geometry.arcProject / projectOnSegment). */
   projectOnWall(w, p) {
-    const { a, b } = this.wallEnds(w);
-    return projectOnSegment(p, a, b);
+    return arcProject(this.wallArc(w), p);
+  }
+
+  /** The wall's centre line as a polyline: two points when straight, the sampled arc when curved. */
+  wallSamples(w, maxSeg = ARC_SAMPLE) {
+    return arcSamples(this.wallArc(w), maxSeg);
   }
 
   wallBetween(n1, n2) {
@@ -325,6 +351,7 @@ export class Model {
   bounds(level) {
     const on = (e) => level == null || e.level === level;
     const pts = this.nodes.filter(on);
+    for (const w of this.walls) if (on(w) && w.bulge) pts.push(...this.wallSamples(w));
     for (const f of this.floors) if (on(f)) pts.push(...f.points);
     for (const s of this.stairs) if (on(s)) pts.push(...this.stairsFootprint(s));
     if (!pts.length) return null;
@@ -458,6 +485,7 @@ export class Model {
         level: na.level,
       };
       this.walls.push(w);
+      if (opts.bulge) this.setWallBulge(w, opts.bulge);
       this.emit();
       return w;
     });
@@ -546,12 +574,21 @@ export class Model {
   }
 
   _split(w, along) {
-    const L = this.wallLength(w);
+    const arc = this.wallArc(w);
+    const L = arc.length;
     if (along < MIN_SPLIT_SEGMENT || along > L - MIN_SPLIT_SEGMENT) return null;
-    const p = this.pointOnWall(w, along);
+    const p = arcPointAt(arc, along).point;
     const node = this.addNode(p.x, p.y, w.level);
     const w1 = { id: this.newId('w'), a: w.a, b: node.id, thickness: w.thickness, height: w.height, level: w.level };
     const w2 = { id: this.newId('w'), a: node.id, b: w.b, thickness: w.thickness, height: w.height, level: w.level };
+    if (arc.curved) {
+      // Both halves keep the curvature: each takes its share of the sweep over its own chord.
+      const sweep1 = arc.sweep * (along / L);
+      const b1 = bulgeFromSweep(dist(arc.a, p), sweep1);
+      const b2 = bulgeFromSweep(dist(p, arc.b), arc.sweep - sweep1);
+      if (Math.abs(b1) >= 1e-4) w1.bulge = b1;
+      if (Math.abs(b2) >= 1e-4) w2.bulge = b2;
+    }
     const idx = this.walls.indexOf(w);
     this.walls.splice(idx, 1, w1, w2);
     for (const o of this.openingsOnWall(w.id)) {
@@ -563,11 +600,24 @@ export class Model {
     return { node, walls: [w1, w2] };
   }
 
+  /** Bend (or straighten) a wall. The sagitta is clamped to the chord length; 0 drops the property. */
+  setWallBulge(w, bulge) {
+    w = this._wall(w);
+    if (!w) return false;
+    const { a, b } = this.wallEnds(w);
+    const chord = dist(a, b);
+    const s = Number.isFinite(+bulge) ? clamp(+bulge, -chord, chord) : 0;
+    if (Math.abs(s) < 1e-4) delete w.bulge;
+    else w.bulge = s;
+    return true;
+  }
+
   updateWall(id, props = {}) {
     const w = this.getWall(id);
     if (!w) return false;
     if (props.thickness != null && Number.isFinite(+props.thickness)) w.thickness = clamp(+props.thickness, 1, 200);
     if (props.height != null && Number.isFinite(+props.height)) w.height = clamp(+props.height, 10, 2000);
+    if (props.bulge != null) this.setWallBulge(w, props.bulge);
     this.clampWallOpenings(id);
     this.emit();
     return true;
@@ -650,7 +700,7 @@ export class Model {
     const tFit = this.fitOpening(wallId, t, width);
     if (tFit == null) return null;
     const o = { id: this.newId('o'), wallId, type, t: tFit, width };
-    if (type === 'door') o.swing = 0;
+    if (openingSpec(type).kind === 'door') o.swing = 0;
     this.openings.push(o);
     this.emit();
     return o;
@@ -706,7 +756,7 @@ export class Model {
     return this.batch(() => {
       if (props.type && isOpeningType(props.type) && props.type !== o.type) {
         o.type = props.type;
-        if (o.type === 'door' && o.swing == null) o.swing = 0;
+        if (openingSpec(o.type).kind === 'door' && o.swing == null) o.swing = 0;
       }
       if (props.swing != null) o.swing = (props.swing | 0) & 3;
       if (props.width != null) this.resizeOpening(id, props.width, 'center');
@@ -754,14 +804,14 @@ export class Model {
 
   /**
    * Add a floor polygon on opts.level (default: the active level). Needs at least 3 distinct points
-   * and a non-zero area; returns the floor or null.
+   * and a non-zero area; returns the floor or null. opts.kind 'cutout' makes it a hole instead of a slab.
    */
   addFloor(points, opts = {}) {
     const pts = cleanPolygon(Array.isArray(points) ? points : []);
     const level = opts.level ?? this.activeLevel;
     if (!pts || !this.getLevel(level)) return null;
     const f = {
-      id: this.newId('f'), level, points: pts,
+      id: this.newId('f'), level, kind: opts.kind === 'cutout' ? 'cutout' : 'slab', points: pts,
       thickness: clamp(num(opts.thickness, FLOOR_DEFAULTS.thickness), 1, 200),
     };
     this.floors.push(f);
@@ -799,22 +849,149 @@ export class Model {
     return f ? Math.abs(polygonArea(f.points)) : 0;
   }
 
+  /** True if every point of `pts` lies inside floor `f` or on its outline. */
+  polygonInFloor(pts, f) {
+    f = typeof f === 'string' ? this.getFloor(f) : f;
+    if (!f || !Array.isArray(pts) || pts.length < 3) return false;
+    const onEdge = (p) => f.points.some((a, i) => distToSegment(p, a, f.points[(i + 1) % f.points.length]) < 0.01);
+    return pts.every((p) => onEdge(p) || pointInPolygon(p, f.points));
+  }
+
   /**
-   * Stairwell holes in a floor: the footprints of stairs on the level directly below that lie
-   * entirely inside the floor polygon (corners on its edge count as inside).
+   * Holes in a floor slab, as polygons: the footprints of stairs on the level directly below, then
+   * the outlines of cutout floors on the same level. Only shapes that lie entirely inside the slab
+   * count, because a partial overlap has no well-defined hole. Cutouts themselves have no holes.
    */
   floorHoles(f) {
     f = typeof f === 'string' ? this.getFloor(f) : f;
-    const below = f && this.levelBelow(f.level);
-    if (!below) return [];
-    const onEdge = (p) => f.points.some((a, i) => distToSegment(p, a, f.points[(i + 1) % f.points.length]) < 0.01);
+    if (!f || f.kind === 'cutout') return [];
     const holes = [];
-    for (const s of this.stairs) {
-      if (s.level !== below.id) continue;
-      const fp = this.stairsFootprint(s);
-      if (fp.every((p) => onEdge(p) || pointInPolygon(p, f.points))) holes.push(fp);
+    const below = this.levelBelow(f.level);
+    if (below) {
+      for (const s of this.stairs) {
+        if (s.level !== below.id) continue;
+        const fp = this.stairsFootprint(s);
+        if (this.polygonInFloor(fp, f)) holes.push(fp);
+      }
+    }
+    for (const c of this.floors) {
+      if (c.kind !== 'cutout' || c.level !== f.level) continue;
+      if (this.polygonInFloor(c.points, f)) holes.push(c.points.map((p) => ({ x: p.x, y: p.y })));
     }
     return holes;
+  }
+
+  /** The slabs that `cutout` actually punches through (empty when it is not inside one). */
+  floorsCutBy(cutout) {
+    const c = typeof cutout === 'string' ? this.getFloor(cutout) : cutout;
+    if (!c || c.kind !== 'cutout') return [];
+    return this.floors.filter((f) => f.kind !== 'cutout' && f.level === c.level && this.polygonInFloor(c.points, f));
+  }
+
+  // ---------------------------------------------------------------- rooms
+
+  /**
+   * Outline of the room that contains `point` on `level`: the inner faces of the walls that enclose
+   * it, mitred at the corners, ready for addFloor. Returns null when the point is not inside a
+   * closed loop of walls.
+   *
+   * Every face of the wall graph is traced (at each node the walk takes the neighbour next to the
+   * way back, in angle order), dead-end walls are pruned first, and the smallest face containing
+   * the point wins. Which side of a wall faces the room is decided per wall by testing an offset
+   * midpoint against the face, so the result does not depend on the winding of the walk.
+   */
+  roomPolygonAt(point, level = this.activeLevel) {
+    if (!point || !Number.isFinite(point.x) || !Number.isFinite(point.y)) return null;
+    const edges = [];              // half-edges, twins adjacent: 2i and 2i+1
+    const out = new Map();         // nodeId -> half-edge indices leaving it
+    for (const w of this.walls) {
+      if (w.level !== level || this.wallLength(w) < EPS) continue;
+      for (const [from, to] of [[w.a, w.b], [w.b, w.a]]) {
+        const i = edges.length;
+        edges.push({ wall: w, from, to, twin: i % 2 === 0 ? i + 1 : i - 1 });
+        if (!out.has(from)) out.set(from, []);
+        out.get(from).push(i);
+      }
+    }
+    if (edges.length < 6) return null; // a room needs at least three walls
+    // Prune dead ends: a node with one wall cannot bound a room.
+    const alive = edges.map(() => true);
+    for (let pass = 0; pass < edges.length; pass++) {
+      const deg = new Map();
+      for (let i = 0; i < edges.length; i++) if (alive[i]) deg.set(edges[i].from, (deg.get(edges[i].from) || 0) + 1);
+      let changed = false;
+      for (let i = 0; i < edges.length; i++) {
+        if (!alive[i]) continue;
+        if ((deg.get(edges[i].from) || 0) <= 1 || (deg.get(edges[i].to) || 0) <= 1) {
+          alive[i] = false; alive[edges[i].twin] = false; changed = true;
+        }
+      }
+      if (!changed) break;
+    }
+    // Direction each half-edge leaves its node in (the tangent, so curved walls sort correctly).
+    const dirOf = (e) => (e.from === e.wall.a
+      ? this.wallDirAt(e.wall, 0)
+      : scale(this.wallDirAt(e.wall, this.wallLength(e.wall)), -1));
+    for (const [node, list] of out) {
+      out.set(node, list.filter((i) => alive[i]).sort((i, j) => angleOf(dirOf(edges[i])) - angleOf(dirOf(edges[j]))));
+    }
+    const seen = edges.map(() => false);
+    let best = null;
+    for (let i = 0; i < edges.length; i++) {
+      if (!alive[i] || seen[i]) continue;
+      const cycle = [];
+      let cur = i;
+      while (!seen[cur]) {
+        seen[cur] = true;
+        cycle.push(cur);
+        const list = out.get(edges[cur].to) || [];
+        const k = list.indexOf(edges[cur].twin);
+        if (k < 0) { cycle.length = 0; break; }
+        cur = list[(k - 1 + list.length) % list.length];
+      }
+      if (cycle.length < 3) continue;
+      const pts = cycle.map((j) => this.getNode(edges[j].from)).filter(Boolean);
+      if (pts.length !== cycle.length || !pointInPolygon(point, pts)) continue;
+      const area = Math.abs(polygonArea(pts));
+      if (area > 1 && (!best || area < best.area)) best = { cycle, pts, area };
+    }
+    if (!best) return null;
+    const polys = computeWallPolygons(this, level);
+    const outline = [];
+    for (const j of best.cycle) {
+      const e = edges[j];
+      const pg = polys.get(e.wall.id);
+      if (!pg) return null;
+      const L = this.wallLength(e.wall);
+      const mid = this.pointOnWall(e.wall, L / 2);
+      const n = perp(this.wallDirAt(e.wall, L / 2));
+      // Which side of this wall the room is on.
+      let plus = null;
+      for (const probe of [e.wall.thickness / 2, 1]) {
+        const a = pointInPolygon(add(mid, scale(n, probe)), best.pts);
+        const b = pointInPolygon(add(mid, scale(n, -probe)), best.pts);
+        if (a !== b) { plus = a; break; }
+      }
+      if (plus == null) plus = polygonArea(best.pts) > 0 === (e.from === e.wall.a);
+      const first = e.from === e.wall.a ? (plus ? pg.aPlus : pg.aMinus) : (plus ? pg.bPlus : pg.bMinus);
+      const last = e.from === e.wall.a ? (plus ? pg.bPlus : pg.bMinus) : (plus ? pg.aPlus : pg.aMinus);
+      if (!first || !last) return null;
+      outline.push(first, ...this.wallSideSamples(e.wall, plus, e.from === e.wall.a), last);
+    }
+    return cleanPolygon(outline);
+  }
+
+  /**
+   * Intermediate points along one side of a wall, between its two mitred end corners: empty for a
+   * straight wall, the sampled offset arc for a curved one. `plus` picks the perp(tangent) side and
+   * `forward` the a -> b direction.
+   */
+  wallSideSamples(w, plus, forward) {
+    const arc = this.wallArc(w);
+    if (!arc.curved) return [];
+    const pts = arcSamples(arcOffset(arc, plus ? w.thickness / 2 : -w.thickness / 2));
+    const inner = pts.slice(1, -1); // the ends are the mitred corners the caller already has
+    return forward ? inner : inner.reverse();
   }
 
   // ---------------------------------------------------------------- stairs
@@ -893,8 +1070,10 @@ export class Model {
 
 /**
  * Compute the 2D outline of every wall with mitred joins at shared nodes.
- * Returns Map wallId -> { aPlus, bPlus, bMinus, aMinus, u, n, length } where "plus" is the side
- * the wall normal n = perp(u) points to and u is the unit direction a -> b.
+ * Returns Map wallId -> { aPlus, bPlus, bMinus, aMinus, u, n, length, arc } where "plus" is the
+ * side the wall normal n = perp(u) points to and u is the unit tangent at node a. `arc` is the
+ * centre line (see geometry.arcFromChord), so a curved wall's sides can be drawn as arcs between
+ * the mitred corners.
  * The polygon in order is [aPlus, bPlus, bMinus, aMinus].
  * With `level`, only that level's walls are computed. Walls never join across levels, because
  * nodes belong to a single level.
@@ -905,14 +1084,17 @@ export function computeWallPolygons(model, level = null) {
   for (const w of model.walls) {
     if (level != null && w.level !== level) continue;
     const { a, b } = model.wallEnds(w);
-    const u = normalize(sub(b, a));
+    const arc = model.wallArc(w);
+    // At a joint a curved wall is mitred against its end tangent, exactly like a straight one.
+    const u = arcPointAt(arc, 0).tangent;
+    const uEnd = arcPointAt(arc, arc.length).tangent;
     const n = perp(u);
-    out.set(w.id, { u, n, length: dist(a, b), a, b });
+    out.set(w.id, { u, n, length: arc.length, a, b, arc });
     const h = w.thickness / 2;
     if (!ends.has(w.a)) ends.set(w.a, []);
     if (!ends.has(w.b)) ends.set(w.b, []);
     ends.get(w.a).push({ wall: w, dir: u, half: h, atA: true });
-    ends.get(w.b).push({ wall: w, dir: scale(u, -1), half: h, atA: false });
+    ends.get(w.b).push({ wall: w, dir: scale(uEnd, -1), half: h, atA: false });
   }
   for (const [nodeId, list] of ends) {
     const node = model.getNode(nodeId);

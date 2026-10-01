@@ -18,24 +18,9 @@
   <header class="toolbar" role="toolbar" aria-label="Plan tools">
     <div class="brand">Home Plan</div>
 
-    <div class="group" aria-label="Tools">
-      <button type="button" data-tool="select" title="Select and move (V)">Select <kbd>V</kbd></button>
-      <button type="button" data-tool="wall" title="Draw walls (W)">Wall <kbd>W</kbd></button>
-      <button type="button" data-tool="split" title="Split a wall (S)">Split <kbd>S</kbd></button>
-      <button type="button" data-tool="floor" title="Draw a floor by clicking its corners (G)">Floor <kbd>G</kbd></button>
-      <button type="button" data-tool="stairs" title="Place stairs to the level above (T)">Stairs <kbd>T</kbd></button>
-    </div>
-
     <div class="group" aria-label="Level">
       <select id="level-select" title="Level being edited (PageUp / PageDown)" aria-label="Level"></select>
       <button type="button" data-action="add-level" title="Add an empty level on top">+ Level</button>
-    </div>
-
-    <div class="group" aria-label="Openings">
-      <button type="button" data-tool="door" title="Door (D)">Door <kbd>D</kbd></button>
-      <button type="button" data-tool="window" title="Window (1)">Window <kbd>1</kbd></button>
-      <button type="button" data-tool="window_tall" title="Tall window (2)">Tall <kbd>2</kbd></button>
-      <button type="button" data-tool="window_full" title="Full-height window (3)">Full height <kbd>3</kbd></button>
     </div>
 
     <div class="group" aria-label="History">
@@ -59,6 +44,61 @@
   </header>
 
   <main class="workspace" id="workspace" data-view="split">
+    <aside class="palette" id="palette" aria-label="Primitives">
+      <div class="palette-row">
+        <button type="button" data-tool="select" title="Select and move (V)">Select <kbd>V</kbd></button>
+        <button type="button" data-tool="split" title="Split a wall (S)">Split <kbd>S</kbd></button>
+      </div>
+
+      <details open>
+        <summary>Walls &amp; floors</summary>
+        <div class="palette-grid">
+          <button type="button" data-tool="wall" title="Draw straight walls (W)">Wall <kbd>W</kbd></button>
+          <button type="button" data-tool="curve" title="Draw a curved wall through points (C)">Curved wall <kbd>C</kbd></button>
+          <button type="button" data-tool="floor" title="Draw a floor by clicking its corners (G)">Floor <kbd>G</kbd></button>
+          <button type="button" data-tool="fill" title="Fill a closed room with a floor in one click (R)">Floor fill <kbd>R</kbd></button>
+          <button type="button" data-tool="cutout" title="Cut a hole in a floor (H)">Floor cutout <kbd>H</kbd></button>
+        </div>
+      </details>
+
+      <details open>
+        <summary>Windows</summary>
+        <div class="palette-grid">
+          <button type="button" data-tool="window" title="Window (1)">Window <kbd>1</kbd></button>
+          <button type="button" data-tool="window_tall" title="Tall window (2)">Tall <kbd>2</kbd></button>
+          <button type="button" data-tool="window_full" title="Full-height window (3)">Full height <kbd>3</kbd></button>
+          <button type="button" data-tool="window_small" title="Small 30 x 30 window high in the wall (4)">Small <kbd>4</kbd></button>
+          <button type="button" data-tool="window_double" title="Double window (5)">Double <kbd>5</kbd></button>
+          <button type="button" data-tool="window_double_tall" title="Double tall window (6)">Double tall <kbd>6</kbd></button>
+          <button type="button" data-tool="window_double_full" title="Double full-height window (7)">Double full <kbd>7</kbd></button>
+        </div>
+      </details>
+
+      <details open>
+        <summary>Doors</summary>
+        <div class="palette-grid">
+          <button type="button" data-tool="door" title="Door (D)">Door <kbd>D</kbd></button>
+          <button type="button" data-tool="door_double" title="Double door">Double door</button>
+          <button type="button" data-tool="door_slide" title="Sliding door">Sliding door</button>
+          <button type="button" data-tool="door_garage" title="Garage door">Garage door</button>
+        </div>
+      </details>
+
+      <details open>
+        <summary>Stairs</summary>
+        <div class="palette-grid">
+          <button type="button" data-tool="stairs" title="Place stairs to the level above (T)">Stairs <kbd>T</kbd></button>
+        </div>
+      </details>
+
+      <details>
+        <summary>Furniture</summary>
+        <div class="palette-grid">
+          <p class="palette-empty">Nothing here yet.</p>
+        </div>
+      </details>
+    </aside>
+
     <section class="pane pane-2d" aria-label="2D plan">
       <div class="pane-head">
         <span>Plan</span>

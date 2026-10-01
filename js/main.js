@@ -2,7 +2,7 @@
 
 import { Model, History, createSampleModel } from './model.js';
 import { Editor2D, TOOLS } from './editor2d.js';
-import { OPENING_TYPES, MIN_OPENING_WIDTH, openingDims } from './catalog.js';
+import { OPENING_TYPES, MIN_OPENING_WIDTH, openingDims, openingSpec } from './catalog.js';
 import { round } from './geometry.js';
 
 const STORAGE_KEY = 'homeplan.plan.v1';
@@ -202,7 +202,8 @@ async function importJSON(file) {
 
 // ------------------------------------------------------------------ toolbar
 
-document.querySelector('.toolbar').addEventListener('click', (e) => {
+/** Clicks on the header toolbar and the left palette: tools, layout and actions. */
+function onChromeClick(e) {
   const b = e.target.closest('button');
   if (!b) return;
   if (b.dataset.tool) editor.setTool(b.dataset.tool);
@@ -224,7 +225,9 @@ document.querySelector('.toolbar').addEventListener('click', (e) => {
       break;
     default: break;
   }
-});
+}
+
+for (const el of [$('.toolbar'), $('#palette')]) el.addEventListener('click', onChromeClick);
 
 for (const b of $$('[data-expand]')) {
   b.addEventListener('click', () => {
@@ -296,35 +299,53 @@ function renderProps(force = false) {
       ${readout('Elevation', fmt(model.levelElevation(L)))}
       ${readout('Walls', walls.length)}
       ${readout('Openings', model.openings.filter((o) => wallIds.has(o.wallId)).length)}
-      ${readout('Floors', model.floors.filter((f) => f.level === L).length)}
+      ${readout('Floors', model.floors.filter((f) => f.level === L && f.kind !== 'cutout').length)}
+      ${readout('Cutouts', model.floors.filter((f) => f.level === L && f.kind === 'cutout').length)}
       ${readout('Stairs', model.stairs.filter((st) => st.level === L).length)}
       ${readout('Total wall length', `${round(total / 100, 2)} m`)}
       ${model.levels.length > 1 ? '<div class="actions"><button type="button" class="danger" data-prop-action="delete-level">Delete level</button></div>' : ''}
       <p class="hint">Counts are for this level. Select a wall, corner, door, window, floor or stairs to edit it. Placement snaps to a 10 cm grid; hold Alt to place freely.</p>
       <ul class="keys">
-        <li>Select <kbd>V</kbd></li><li>Wall <kbd>W</kbd></li><li>Split <kbd>S</kbd></li>
-        <li>Floor <kbd>G</kbd></li><li>Close floor <kbd>Enter</kbd></li><li>Stairs <kbd>T</kbd></li>
+        <li>Select <kbd>V</kbd></li><li>Wall <kbd>W</kbd></li><li>Curved wall <kbd>C</kbd></li>
+        <li>Split <kbd>S</kbd></li><li>Floor <kbd>G</kbd></li><li>Floor fill <kbd>R</kbd></li>
+        <li>Floor cutout <kbd>H</kbd></li><li>Close outline <kbd>Enter</kbd></li><li>Stairs <kbd>T</kbd></li>
         <li>Door <kbd>D</kbd></li><li>Window <kbd>1</kbd></li><li>Tall window <kbd>2</kbd></li>
-        <li>Full-height window <kbd>3</kbd></li><li>Delete <kbd>Del</kbd></li>
+        <li>Full-height window <kbd>3</kbd></li><li>Small window <kbd>4</kbd></li>
+        <li>Double windows <kbd>5 / 6 / 7</kbd></li><li>Delete <kbd>Del</kbd></li>
         <li>Level up / down <kbd>PgUp / PgDn</kbd></li>
         <li>Undo / redo <kbd>Ctrl+Z / Ctrl+Y</kbd></li><li>Pan <kbd>Space+drag</kbd></li><li>Fit <kbd>F</kbd></li>
       </ul>`;
   } else if (sel.kind === 'wall') {
     const w = ent;
-    html = `<h2>Wall</h2>
-      ${readout('Length', fmt(model.wallLength(w)))}
+    const arc = model.wallArc(w);
+    const ends = model.wallEnds(w);
+    html = `<h2>${arc.curved ? 'Curved wall' : 'Wall'}</h2>
+      ${readout(arc.curved ? 'Arc length' : 'Length', fmt(arc.length))}
+      ${field('Bulge (cm)', numInput('bulge', w.bulge || 0, { min: -2000, max: 2000, step: 10 }))}
+      ${arc.curved ? readout('Chord', fmt(Math.hypot(ends.b.x - ends.a.x, ends.b.y - ends.a.y))) : ''}
+      ${arc.curved ? readout('Radius', fmt(arc.R)) : ''}
       ${field('Thickness (cm)', numInput('thickness', w.thickness, { min: 1, max: 200, step: 1 }))}
       ${field('Height (cm)', numInput('height', w.height, { min: 10, max: 2000, step: 10 }))}
       ${readout('Openings', model.openingsOnWall(w.id).length)}
       <div class="actions">
         <button type="button" data-prop-action="split">Split in half</button>
+        ${arc.curved ? '<button type="button" data-prop-action="straighten">Straighten</button>' : ''}
         <button type="button" class="danger" data-prop-action="delete">Delete</button>
       </div>
-      <p class="hint">Drag the wall to move it; connected walls stretch. Double-click or right-click it to split at a point.</p>`;
+      <p class="hint">Drag the wall to move it; connected walls stretch. Drag the round handle in the middle to bend it, or set the bulge here. Double-click or right-click it to split at a point.</p>`;
   } else if (sel.kind === 'opening') {
     const o = ent;
     const w = model.getWall(o.wallId);
     const d = openingDims(o.type, w.height);
+    const spec = openingSpec(o.type);
+    // Doors can be flipped: which side they open to, and (bar a garage door) the hinge or slide end.
+    const flips = [];
+    if (spec.kind === 'door') {
+      if (spec.style !== 'garage' && spec.leaves < 2) {
+        flips.push(`<button type="button" data-prop-action="flip-hinge">${spec.style === 'slide' ? 'Flip direction' : 'Flip hinge'}</button>`);
+      }
+      flips.push('<button type="button" data-prop-action="flip-side">Flip side</button>');
+    }
     const options = Object.entries(OPENING_TYPES)
       .map(([k, c]) => `<option value="${k}"${k === o.type ? ' selected' : ''}>${c.label}</option>`).join('');
     html = `<h2>${OPENING_TYPES[o.type].label}</h2>
@@ -336,7 +357,7 @@ function renderProps(force = false) {
       ${readout('From wall start', fmt(o.t - o.width / 2))}
       ${readout('Wall length', fmt(model.wallLength(w)))}
       <div class="actions">
-        ${o.type === 'door' ? '<button type="button" data-prop-action="flip-hinge">Flip hinge</button><button type="button" data-prop-action="flip-side">Flip side</button>' : ''}
+        ${flips.join('')}
         <button type="button" class="danger" data-prop-action="delete">Delete</button>
       </div>
       <p class="hint">Drag to slide it along the wall or onto another wall. Drag the square handles to resize; hold Shift to keep the opposite edge fixed.</p>`;
@@ -348,15 +369,25 @@ function renderProps(force = false) {
       ${readout('Connected walls', model.wallsAtNode(n.id).length)}
       <div class="actions"><button type="button" class="danger" data-prop-action="delete">Delete corner</button></div>
       <p class="hint">Drag the corner to reshape every attached wall. Drop it on another corner to join them.</p>`;
+  } else if (sel.kind === 'floor' && ent.kind === 'cutout') {
+    const f = ent;
+    const cuts = model.floorsCutBy(f).length;
+    html = `<h2>Floor cutout</h2>
+      ${readout('Area', `${round(model.floorArea(f) / 10000, 2)} m²`)}
+      ${readout('Corners', f.points.length)}
+      ${readout('Cuts floors', cuts)}
+      <div class="actions"><button type="button" class="danger" data-prop-action="delete">Delete</button></div>
+      <p class="hint">${cuts ? 'Drag the outline to move it, or drag a square handle to move a corner.'
+        : 'This cutout is not inside a floor on this level, so it cuts nothing. A cutout has to fit entirely inside the floor it punches through.'}</p>`;
   } else if (sel.kind === 'floor') {
     const f = ent;
     html = `<h2>Floor</h2>
       ${field('Thickness (cm)', numInput('thickness', f.thickness, { min: 1, max: 200, step: 1 }))}
       ${readout('Area', `${round(model.floorArea(f) / 10000, 2)} m²`)}
       ${readout('Corners', f.points.length)}
-      ${readout('Stairwells', model.floorHoles(f).length)}
+      ${readout('Holes', model.floorHoles(f).length)}
       <div class="actions"><button type="button" class="danger" data-prop-action="delete">Delete</button></div>
-      <p class="hint">Drag the floor to move it, or drag a square handle to move a corner. Stairs on the level below cut a stairwell when they fit inside it.</p>`;
+      <p class="hint">Drag the floor to move it, or drag a square handle to move a corner. Stairs on the level below and cutouts on this level cut holes when they fit inside it.</p>`;
   } else if (sel.kind === 'stairs') {
     const st = ent;
     const info = model.stairsInfo(st);
@@ -419,6 +450,11 @@ $('#props-body').addEventListener('click', (e) => {
     case 'delete': editor.deleteSelection(); break;
     case 'rotate': editor.rotateStairs(sel.id); break;
     case 'split': editor.splitSelectedInHalf(); break;
+    case 'straighten':
+      model.updateWall(sel.id, { bulge: 0 });
+      history.commit();
+      updateHistoryButtons();
+      break;
     case 'flip-hinge': editor.flipDoor(sel.id, 1); break;
     case 'flip-side': editor.flipDoor(sel.id, 2); break;
     default: break;

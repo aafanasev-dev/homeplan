@@ -1,8 +1,11 @@
 // Assertions for model.js / geometry.js. No DOM: used by tests.html and run-tests.mjs (node).
 
 import { Model, History, computeWallPolygons, createSampleModel } from './model.js';
-import { snap, projectOnSegment, lineIntersect, dist, pointInPolygon, polygonArea } from './geometry.js';
-import { openingDims, MIN_OPENING_WIDTH } from './catalog.js';
+import {
+  snap, projectOnSegment, lineIntersect, dist, pointInPolygon, polygonArea,
+  arcFromChord, arcPointAt, arcProject, arcSamples, arcOffset, sagittaThrough, splineBulges,
+} from './geometry.js';
+import { openingDims, openingSpec, OPENING_TYPES, MIN_OPENING_WIDTH } from './catalog.js';
 
 const tests = [];
 const test = (name, fn) => tests.push({ name, fn });
@@ -530,6 +533,178 @@ test('activeLevel is not in undo snapshots', () => {
   eq(m.levels.length, 1); eq(m.activeLevel, l1, 'falls back when the level is gone');
   h.redo();
   eq(m.activeLevel, l1, 'redo does not switch either');
+});
+
+
+// ------------------------------------------------------------------ arcs & curved walls
+
+/** Area of a polygon, as the editor would see it. */
+const area = (pts) => Math.abs(polygonArea(pts));
+
+test('geometry: an arc from a chord and a sagitta', () => {
+  const a = { x: 0, y: 0 }, b = { x: 100, y: 0 };
+  const arc = arcFromChord(a, b, 50); // a semicircle bulging towards +y
+  assert(arc.curved, 'curved');
+  near(arc.R, 50, 'radius'); near(arc.length, Math.PI * 50, 'arc length');
+  nearPt(arcPointAt(arc, arc.length / 2).point, { x: 50, y: 50 }, 'midpoint');
+  nearPt(arcPointAt(arc, 0).point, a, 'start'); nearPt(arcPointAt(arc, arc.length).point, b, 'end');
+  nearPt(arcPointAt(arc, 0).tangent, { x: 0, y: 1 }, 'tangent at the start', 1e-9);
+  eq(arcFromChord(a, b, 0).curved, false, 'no bulge is straight');
+  eq(arcFromChord(a, b, 1e-9).curved, false, 'a negligible bulge is straight');
+  near(arcFromChord(a, b, 5000).bulge, 100, 'clamped to the chord length');
+});
+
+test('geometry: projecting onto an arc clamps to its ends', () => {
+  const arc = arcFromChord({ x: 0, y: 0 }, { x: 100, y: 0 }, 50);
+  const on = arcProject(arc, { x: 50, y: 60 });
+  near(on.along, arc.length / 2, 'nearest point is the midpoint'); near(on.dist, 10, 'distance');
+  near(on.rawT, 0.5, 'rawT');
+  const past = arcProject(arc, { x: -20, y: -5 });
+  near(past.along, 0, 'clamped to the start');
+  assert(past.rawT < 0, 'rawT marks a point past the start');
+  assert(arcProject(arc, { x: 120, y: -5 }).rawT > 1, 'rawT marks a point past the end');
+});
+
+test('geometry: offsetting an arc follows its sides', () => {
+  const arc = arcFromChord({ x: 0, y: 0 }, { x: 100, y: 0 }, 50);
+  const plus = arcOffset(arc, 10), minus = arcOffset(arc, -10);
+  near(plus.R, 60, 'outer radius'); near(minus.R, 40, 'inner radius');
+  nearPt(arcPointAt(plus, plus.length / 2).point, { x: 50, y: 60 }, 'offset midpoint');
+  nearPt(arcPointAt(minus, minus.length / 2).point, { x: 50, y: 40 }, 'inner midpoint');
+  // Every sample sits 10 cm off the centre line, on the right side.
+  for (const q of arcSamples(plus, 10)) near(dist(q, arc.centre), 60, 'sample radius', 1e-6);
+  const straight = arcOffset(arcFromChord({ x: 0, y: 0 }, { x: 100, y: 0 }), 10);
+  nearPt(straight.a, { x: 0, y: 10 }, 'straight offset');
+});
+
+test('geometry: a spline through points gives one bulge per segment', () => {
+  eq(splineBulges([{ x: 0, y: 0 }, { x: 100, y: 0 }, { x: 200, y: 0 }]).every((b) => Math.abs(b) < 1e-9), true, 'collinear is straight');
+  near(sagittaThrough({ x: 0, y: 0 }, { x: 100, y: 0 }, { x: 50, y: 50 }), 50, 'sagitta');
+  const hump = splineBulges([{ x: 0, y: 0 }, { x: 100, y: 60 }, { x: 200, y: 0 }]);
+  eq(hump.length, 2, 'one per segment');
+  assert(hump[0] > 0 && Math.abs(hump[0] - hump[1]) < 1e-9, 'a symmetric hump bends both segments alike');
+  const ess = splineBulges([{ x: 0, y: 0 }, { x: 100, y: 0 }, { x: 200, y: 100 }, { x: 300, y: 100 }]);
+  near(ess[1], 0, 'the straight middle of an S stays straight');
+  assert(ess[0] * ess[2] < 0, 'and its ends bend opposite ways');
+});
+
+test('a curved wall measures and splits along its arc', () => {
+  const m = new Model();
+  const w = m.addWall({ x: 0, y: 0 }, { x: 400, y: 0 }, { bulge: 80 });
+  near(w.bulge, 80, 'stored');
+  assert(m.wallLength(w) > 400, 'longer than the chord');
+  near(m.wallLength(w), m.wallArc(w).length);
+  nearPt(m.pointOnWall(w, m.wallLength(w) / 2), { x: 200, y: 80 }, 'middle of the arc', 1e-6);
+  const total = m.wallLength(w);
+  const res = m.splitWall(w.id, { x: 200, y: 400 });
+  assert(res, 'split');
+  near(res.walls[0].bulge, res.walls[1].bulge, 'both halves bend the same way');
+  assert(res.walls[0].bulge > 0, 'and in the original direction');
+  near(m.wallLength(res.walls[0]) + m.wallLength(res.walls[1]), total, 'the halves add up', 1e-6);
+  m.updateWall(res.walls[0].id, { bulge: 0 });
+  eq(res.walls[0].bulge, undefined, 'straightening drops the property');
+});
+
+test('openings sit on the arc of a curved wall', () => {
+  const m = new Model();
+  const w = m.addWall({ x: 0, y: 0 }, { x: 400, y: 0 });
+  const o = m.addOpening(w.id, 'window', 200, 120);
+  m.updateWall(w.id, { bulge: 120 });
+  const L = m.wallLength(w);
+  assert(o.t - o.width / 2 >= -1e-9 && o.t + o.width / 2 <= L + 1e-9, 'still inside the longer wall');
+  near(dist(m.pointOnWall(w, o.t), m.wallArc(w).centre), m.wallArc(w).R, 'the centre of the opening is on the arc', 1e-6);
+  m.updateWall(w.id, { bulge: 0 });
+  near(m.wallLength(w), 400, 'back to the chord');
+  assert(o.t + o.width / 2 <= 400 + 1e-9, 'and the opening was pulled back in');
+});
+
+test('bulge survives toJSON / load and is clamped to the chord', () => {
+  const m = new Model();
+  const w = m.addWall({ x: 0, y: 0 }, { x: 300, y: 0 }, { bulge: 60 });
+  const json = m.serialize();
+  eq(JSON.parse(json).walls[0].bulge, w.bulge, 'serialised');
+  const m2 = new Model(json);
+  eq(m2.serialize(), json, 'round trip');
+  const m3 = new Model({ version: 2, nodes: [
+    { id: 'n1', x: 0, y: 0 }, { id: 'n2', x: 100, y: 0 },
+  ], walls: [{ id: 'w1', a: 'n1', b: 'n2', bulge: 9999 }] });
+  near(m3.walls[0].bulge, 100, 'clamped to the chord length on load');
+  const m4 = new Model({ version: 2, nodes: [
+    { id: 'n1', x: 0, y: 0 }, { id: 'n2', x: 100, y: 0 },
+  ], walls: [{ id: 'w1', a: 'n1', b: 'n2' }] });
+  eq('bulge' in m4.walls[0], false, 'a straight wall stores nothing');
+});
+
+// ------------------------------------------------------------------ catalog additions
+
+test('catalog: the small window hangs below the ceiling and doubles have two panes', () => {
+  const d = openingDims('window_small', 270);
+  eq(d.height, 30); eq(d.sill, 220); eq(d.top, 250);
+  eq(openingDims('window_small', 40).sill, 0, 'a low wall pushes it down to the floor');
+  eq(openingSpec('window_double').panes, 2);
+  eq(openingSpec('window').panes, 1);
+  eq(openingSpec('door_double').leaves, 2);
+  eq(openingSpec('door_slide').style, 'slide');
+  eq(openingSpec('door_garage').style, 'garage');
+  eq(openingSpec('door').style, 'swing');
+});
+
+test('every door type gets a swing, every opening type a sane default width', () => {
+  const m = new Model();
+  for (const [type, spec] of Object.entries(OPENING_TYPES)) {
+    const w = m.addWall({ x: 0, y: m.walls.length * 100 }, { x: 600, y: m.walls.length * 100 });
+    const o = m.addOpening(w.id, type, 300);
+    assert(o, `placed ${type}`);
+    eq(o.width, spec.width, `${type} width`);
+    eq(spec.kind === 'door', o.swing != null, `${type} swing`);
+  }
+});
+
+// ------------------------------------------------------------------ cutouts & room fill
+
+test('a cutout punches a hole in the floor it sits in', () => {
+  const m = new Model();
+  const f = m.addFloor([{ x: 0, y: 0 }, { x: 600, y: 0 }, { x: 600, y: 400 }, { x: 0, y: 400 }]);
+  eq(f.kind, 'slab', 'floors are slabs by default');
+  const c = m.addFloor([{ x: 100, y: 100 }, { x: 200, y: 100 }, { x: 200, y: 200 }, { x: 100, y: 200 }], { kind: 'cutout' });
+  eq(c.kind, 'cutout');
+  eq(m.floorHoles(f).length, 1, 'one hole');
+  eq(m.floorHoles(c).length, 0, 'a cutout has no holes of its own');
+  eq(m.floorsCutBy(c).length, 1, 'it cuts the slab');
+  const out = m.addFloor([{ x: 500, y: 300 }, { x: 900, y: 300 }, { x: 900, y: 500 }], { kind: 'cutout' });
+  eq(m.floorsCutBy(out).length, 0, 'a partly overlapping cutout cuts nothing');
+  eq(m.floorHoles(f).length, 1, 'and makes no hole');
+  const l2 = m.addLevel().id;
+  const up = m.addFloor([{ x: 100, y: 100 }, { x: 200, y: 100 }, { x: 200, y: 200 }], { kind: 'cutout', level: l2 });
+  eq(m.floorsCutBy(up).length, 0, 'cutouts only cut their own level');
+  eq(m.serialize(), new Model(m.serialize()).serialize(), 'kind survives a round trip');
+});
+
+test('roomPolygonAt traces the room under a point', () => {
+  const m = new Model();
+  const pts = [{ x: 0, y: 0 }, { x: 600, y: 0 }, { x: 600, y: 400 }, { x: 0, y: 400 }];
+  const walls = pts.map((p, i) => m.addWall(p, pts[(i + 1) % 4]));
+  const room = m.roomPolygonAt({ x: 300, y: 200 });
+  assert(room, 'found');
+  eq(room.length, 4, 'four corners');
+  near(area(room), (600 - 15) * (400 - 15), 'inside the wall faces');
+  eq(m.roomPolygonAt({ x: 900, y: 200 }), null, 'outside any room');
+  eq(m.roomPolygonAt({ x: 300, y: 200 }, m.addLevel().id), null, 'another level is empty');
+  // A stub wall sticking into the room is ignored.
+  m.addWall({ x: 300, y: 0 }, { x: 300, y: 120 }, { splitWalls: true });
+  near(area(m.roomPolygonAt({ x: 300, y: 300 })), (600 - 15) * (400 - 15), 'the stub does not split the room');
+  // A wall across it does split it.
+  m.addWall({ x: 300, y: 120 }, { x: 300, y: 400 }, { splitWalls: true });
+  near(area(m.roomPolygonAt({ x: 150, y: 200 })), (300 - 15) * (400 - 15), 'left half');
+  near(area(m.roomPolygonAt({ x: 450, y: 200 })), (300 - 15) * (400 - 15), 'right half');
+  // Bowing a wall outwards makes the room bigger and the outline follows the arc.
+  const straight = area(m.roomPolygonAt({ x: 150, y: 200 }));
+  m.updateWall(walls[3].id, { bulge: -100 });
+  const bowed = m.roomPolygonAt({ x: 150, y: 200 });
+  assert(bowed.length > 4, 'the curved side is sampled');
+  assert(area(bowed) > straight, 'and the room grew');
+  m.updateWall(walls[3].id, { bulge: 100 });
+  assert(area(m.roomPolygonAt({ x: 150, y: 200 })) < straight, 'bowing the other way shrinks it');
 });
 
 /** Run every test. Returns { passed, failed, results: [{ name, ok, error }] }. */
