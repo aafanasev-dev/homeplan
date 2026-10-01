@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Home Plan Tests</title>
+  <style>
+    :root { --bg: #fbfaf7; --text: #1f2329; --pass: #15803d; --fail: #dc2626; --muted: #6b6f76; color-scheme: light; }
+    @media (prefers-color-scheme: dark) {
+      :root:not([data-theme="light"]) { --bg: #17191c; --text: #e6e7e9; --pass: #4ade80; --fail: #f87171; --muted: #9aa0a8; color-scheme: dark; }
+    }
+    body { margin: 0; padding: 24px 16px; background: var(--bg); color: var(--text); font: 14px/1.5 system-ui, sans-serif; }
+    main { max-width: 760px; margin: 0 auto; }
+    h1 { font-size: 20px; margin: 0 0 4px; }
+    #summary { font-weight: 600; margin: 8px 0 16px; }
+    ul { list-style: none; padding: 0; margin: 0; }
+    li { padding: 3px 0; border-bottom: 1px solid rgba(127,127,127,.2); overflow-wrap: anywhere; }
+    .ok { color: var(--pass); } .bad { color: var(--fail); }
+    .err { display: block; color: var(--muted); font-size: 12px; padding-left: 44px; }
+    a { color: inherit; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Model tests</h1>
+    <p><a href="index.html">Back to the editor</a>. Results are also printed to the browser console.</p>
+    <div id="summary">Running...</div>
+    <ul id="results"></ul>
+  </main>
+  <script type="module">
+    import { runModelTests } from './js/model.test.js';
+    const { passed, failed, results } = runModelTests();
+    const list = document.getElementById('results');
+    for (const r of results) {
+      const li = document.createElement('li');
+      li.innerHTML = `<strong class="${r.ok ? 'ok' : 'bad'}">${r.ok ? 'PASS' : 'FAIL'}</strong> `;
+      li.append(r.name);
+      if (!r.ok) { const e = document.createElement('span'); e.className = 'err'; e.textContent = r.error; li.append(e); }
+      list.append(li);
+      (r.ok ? console.log : console.error)(`${r.ok ? 'PASS' : 'FAIL'} ${r.name}${r.ok ? '' : ': ' + r.error}`);
+    }
+    const s = document.getElementById('summary');
+    s.textContent = `${passed} passed, ${failed} failed`;
+    s.className = failed ? 'bad' : 'ok';
+    console.log(`${passed} passed, ${failed} failed`);
+  </script>
+</body>
+</html>

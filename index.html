@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Home Plan Editor</title>
+  <link rel="stylesheet" href="style.css">
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.169.0/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.169.0/examples/jsm/"
+    }
+  }
+  </script>
+</head>
+<body>
+  <header class="toolbar" role="toolbar" aria-label="Plan tools">
+    <div class="brand">Home Plan</div>
+
+    <div class="group" aria-label="Tools">
+      <button type="button" data-tool="select" title="Select and move (V)">Select <kbd>V</kbd></button>
+      <button type="button" data-tool="wall" title="Draw walls (W)">Wall <kbd>W</kbd></button>
+      <button type="button" data-tool="split" title="Split a wall (S)">Split <kbd>S</kbd></button>
+    </div>
+
+    <div class="group" aria-label="Openings">
+      <button type="button" data-tool="door" title="Door (D)">Door <kbd>D</kbd></button>
+      <button type="button" data-tool="window" title="Window (1)">Window <kbd>1</kbd></button>
+      <button type="button" data-tool="window_tall" title="Tall window (2)">Tall <kbd>2</kbd></button>
+      <button type="button" data-tool="window_full" title="Full-height window (3)">Full height <kbd>3</kbd></button>
+    </div>
+
+    <div class="group" aria-label="History">
+      <button type="button" data-action="undo" title="Undo (Ctrl+Z)">Undo</button>
+      <button type="button" data-action="redo" title="Redo (Ctrl+Y)">Redo</button>
+    </div>
+
+    <div class="group segmented" aria-label="Layout">
+      <button type="button" data-view="2d" title="2D plan full width">2D</button>
+      <button type="button" data-view="split" title="Side by side">Split</button>
+      <button type="button" data-view="3d" title="3D view full width">3D</button>
+    </div>
+
+    <div class="group" aria-label="File">
+      <button type="button" data-action="fit" title="Fit plan in both views (F)">Fit</button>
+      <button type="button" data-action="new" title="Start an empty plan">New</button>
+      <button type="button" data-action="import" title="Load a plan from a JSON file">Import</button>
+      <button type="button" data-action="export" title="Save the plan as a JSON file">Export</button>
+      <input type="file" id="import-file" accept=".json,application/json" hidden>
+    </div>
+  </header>
+
+  <main class="workspace" id="workspace" data-view="split">
+    <section class="pane pane-2d" aria-label="2D plan">
+      <div class="pane-head">
+        <span>Plan</span>
+        <button type="button" class="pane-toggle" data-expand="2d" title="Expand or restore the 2D plan">Expand</button>
+      </div>
+      <div class="canvas-wrap">
+        <canvas id="plan" tabindex="0" aria-label="Floor plan editor"></canvas>
+        <div id="ctxmenu" class="ctxmenu" role="menu" hidden></div>
+      </div>
+      <div class="status" id="status" aria-live="polite"></div>
+    </section>
+
+    <section class="pane pane-3d" aria-label="3D view">
+      <div class="pane-head">
+        <span>3D</span>
+        <span class="pane-hint">Drag to orbit, right-drag to pan, scroll to zoom</span>
+        <button type="button" class="pane-toggle" data-expand="3d" title="Expand or restore the 3D view">Expand</button>
+      </div>
+      <div class="view3d" id="view3d">
+        <div class="view3d-msg" id="view3d-msg">Loading 3D view...</div>
+      </div>
+    </section>
+
+    <aside class="props" id="props" aria-label="Properties">
+      <div id="props-body"></div>
+    </aside>
+  </main>
+
+  <script type="module" src="js/main.js"></script>
+</body>
+</html>
