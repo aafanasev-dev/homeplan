@@ -58,6 +58,23 @@ export function lineIntersect(p1, d1, p2, d2) {
   return add(p1, scale(d1, s));
 }
 
+/** Signed area of a polygon (shoelace). Positive when the points run clockwise on screen (y down). */
+export function polygonArea(pts) {
+  let a = 0;
+  for (let i = 0, n = pts.length; i < n; i++) a += cross(pts[i], pts[(i + 1) % n]);
+  return a / 2;
+}
+
+/** True if p lies inside the polygon (even-odd ray casting). Points exactly on an edge are unreliable. */
+export function pointInPolygon(p, pts) {
+  let inside = false;
+  for (let i = 0, j = pts.length - 1; i < pts.length; j = i++) {
+    const a = pts[i], b = pts[j];
+    if ((a.y > p.y) !== (b.y > p.y) && p.x < ((b.x - a.x) * (p.y - a.y)) / (b.y - a.y) + a.x) inside = !inside;
+  }
+  return inside;
+}
+
 /** Round to a fixed number of decimals, avoiding float noise like 299.99999. */
 export function round(v, decimals = 2) {
   const k = 10 ** decimals;

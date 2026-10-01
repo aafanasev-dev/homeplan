@@ -1,6 +1,9 @@
-// Default sizes for each opening type, and wall defaults. All units in cm. No DOM.
+// Default sizes for each opening type, plus wall, floor and stair defaults. All units in cm. No DOM.
 
 export const WALL_DEFAULTS = { thickness: 15, height: 270 };
+export const FLOOR_DEFAULTS = { thickness: 20 };
+/** riser is the target step height; the real riser is rise / round(rise / riser). */
+export const STAIR_DEFAULTS = { width: 100, length: 300, riser: 18 };
 export const MIN_OPENING_WIDTH = 30;
 
 /**

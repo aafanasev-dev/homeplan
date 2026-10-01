@@ -1,7 +1,7 @@
 // Assertions for model.js / geometry.js. No DOM: used by tests.html and run-tests.mjs (node).
 
 import { Model, History, computeWallPolygons, createSampleModel } from './model.js';
-import { snap, projectOnSegment, lineIntersect, dist } from './geometry.js';
+import { snap, projectOnSegment, lineIntersect, dist, pointInPolygon, polygonArea } from './geometry.js';
 import { openingDims, MIN_OPENING_WIDTH } from './catalog.js';
 
 const tests = [];
@@ -324,6 +324,212 @@ test('sample model is valid', () => {
     assert(o.t - o.width / 2 >= -1e-9 && o.t + o.width / 2 <= L + 1e-9, `${o.id} inside wall`);
   }
   assert(dist(m.nodes[0], m.nodes[1]) > 0);
+});
+
+// ------------------------------------------------------------------ levels, floors & stairs
+
+test('geometry: point in polygon and polygon area', () => {
+  const sq = [{ x: 0, y: 0 }, { x: 100, y: 0 }, { x: 100, y: 100 }, { x: 0, y: 100 }];
+  assert(pointInPolygon({ x: 50, y: 50 }, sq), 'inside');
+  assert(!pointInPolygon({ x: 150, y: 50 }, sq), 'outside');
+  const l = [{ x: 0, y: 0 }, { x: 200, y: 0 }, { x: 200, y: 100 }, { x: 100, y: 100 }, { x: 100, y: 200 }, { x: 0, y: 200 }];
+  assert(!pointInPolygon({ x: 150, y: 150 }, l), 'notch of an L shape');
+  near(Math.abs(polygonArea(sq)), 10000);
+});
+
+test('v1 data migrates to a single level', () => {
+  const m = new Model({
+    version: 1, nextId: 4,
+    nodes: [{ id: 'n1', x: 0, y: 0 }, { id: 'n2', x: 300, y: 0 }],
+    walls: [{ id: 'w3', a: 'n1', b: 'n2', thickness: 15, height: 270 }],
+    openings: [],
+  });
+  eq(m.levels.length, 1, 'levels');
+  const L = m.levels[0].id;
+  eq(m.activeLevel, L, 'active');
+  for (const n of m.nodes) eq(n.level, L, `node ${n.id} level`);
+  eq(m.walls[0].level, L, 'wall level');
+  eq(m.floors.length, 0); eq(m.stairs.length, 0);
+  const all = [...m.levels, ...m.nodes, ...m.walls].map((e) => e.id);
+  eq(new Set(all).size, all.length, 'level id unique');
+  const w = m.addWall({ x: 0, y: 100 }, { x: 100, y: 100 });
+  assert(!all.includes(w.id), 'new ids do not collide');
+});
+
+test('load drops entities on unknown levels and walls across levels', () => {
+  const m = new Model({
+    version: 2,
+    levels: [{ id: 'l1', name: 'Ground', height: 270 }, { id: 'l2', name: 'Upper', height: 250 }],
+    nodes: [{ id: 'n1', x: 0, y: 0, level: 'l1' }, { id: 'n2', x: 100, y: 0, level: 'l2' }, { id: 'n3', x: 0, y: 0, level: 'lX' }],
+    walls: [{ id: 'w1', a: 'n1', b: 'n2' }],
+    floors: [{ id: 'f1', level: 'lX', points: [{ x: 0, y: 0 }, { x: 100, y: 0 }, { x: 100, y: 100 }] }],
+    stairs: [{ id: 's1', level: 'l2', x: 0, y: 0, angle: 95 }],
+  });
+  eq(m.nodes.length, 2, 'node on unknown level dropped');
+  eq(m.walls.length, 0, 'wall across levels dropped');
+  eq(m.floors.length, 0, 'floor on unknown level dropped');
+  eq(m.stairs.length, 1); eq(m.stairs[0].angle, 90, 'angle snapped to a quarter turn');
+});
+
+test('addLevel stacks levels and levelElevation sums the heights below', () => {
+  const m = new Model();
+  const l1 = m.levels[0];
+  const l2 = m.addLevel();
+  m.updateLevel(l2.id, { height: 250 });
+  const l3 = m.addLevel();
+  eq(m.levels.length, 3);
+  eq(l2.name, 'Level 2'); eq(l3.height, 270, 'default height');
+  eq(m.levelElevation(l1.id), 0); eq(m.levelElevation(l2.id), 270); eq(m.levelElevation(l3.id), 520);
+  eq(m.levelAbove(l1.id), l2); eq(m.levelBelow(l1.id), null);
+  eq(m.activeLevel, l1.id, 'addLevel does not switch');
+});
+
+test('updateLevel height carries walls that matched the old height', () => {
+  const m = new Model();
+  const L = m.activeLevel;
+  const w1 = m.addWall({ x: 0, y: 0 }, { x: 300, y: 0 });
+  const w2 = m.addWall({ x: 0, y: 100 }, { x: 300, y: 100 }, { height: 120 });
+  m.updateLevel(L, { name: '  Ground  ', height: 300 });
+  eq(m.getLevel(L).name, 'Ground');
+  eq(w1.height, 300); eq(w2.height, 120, 'custom height kept');
+});
+
+test('node snapping, wall splitting and merging stay on one level', () => {
+  const m = new Model();
+  const l1 = m.activeLevel;
+  m.addWall({ x: 0, y: 0 }, { x: 400, y: 0 });
+  const l2 = m.addLevel().id;
+  m.setActiveLevel(l2);
+  const w = m.addWall({ x: 2, y: 3 }, { x: 200, y: 0 }, { splitWalls: true });
+  eq(m.nodes.length, 4, 'no snap to level 1 nodes');
+  eq(m.walls.length, 2, 'level 1 wall not split');
+  eq(w.level, l2);
+  for (const id of [w.a, w.b]) eq(m.getNode(id).level, l2, 'new nodes on level 2');
+  eq(m.nodeNear({ x: 0, y: 0 }, 10), m.getNode(w.a), 'nodeNear defaults to the active level');
+  eq(m.nodeNear({ x: 0, y: 0 }, 10, null, l1).level, l1, 'explicit level');
+  eq(m.mergeNodeIfNear(w.a, 10), null, 'no merge across levels');
+  eq(m.nearestWall({ x: 100, y: 0 }).wall.level, l2);
+  eq(m.bounds(l2).maxX, 200); eq(m.bounds().maxX, 400, 'all levels');
+  eq(computeWallPolygons(m, l2).size, 1);
+  const res = m.splitWall(w.id, { x: 100, y: 1 });
+  for (const sw of res.walls) eq(sw.level, l2, 'split halves keep the level');
+  eq(res.node.level, l2);
+});
+
+test('deleteLevel removes everything on it, but never the last level', () => {
+  const m = new Model();
+  const l1 = m.activeLevel;
+  m.addWall({ x: 0, y: 0 }, { x: 300, y: 0 });
+  const l2 = m.addLevel().id;
+  m.setActiveLevel(l2);
+  const w = m.addWall({ x: 0, y: 0 }, { x: 300, y: 0 });
+  m.addOpening(w.id, 'door', 150);
+  m.addFloor([{ x: 0, y: 0 }, { x: 300, y: 0 }, { x: 300, y: 300 }]);
+  m.addStairs(50, 50);
+  assert(m.deleteLevel(l2), 'deleted');
+  eq(m.levels.length, 1); eq(m.walls.length, 1); eq(m.nodes.length, 2);
+  eq(m.openings.length, 0); eq(m.floors.length, 0); eq(m.stairs.length, 0);
+  eq(m.activeLevel, l1, 'active level falls back');
+  eq(m.deleteLevel(l1), false, 'last level kept');
+});
+
+test('addFloor validates points; vertices and floors move', () => {
+  const m = new Model();
+  eq(m.addFloor([{ x: 0, y: 0 }, { x: 100, y: 0 }]), null, 'two points');
+  eq(m.addFloor([{ x: 0, y: 0 }, { x: 100, y: 0 }, { x: 200, y: 0 }]), null, 'zero area');
+  eq(m.addFloor([{ x: 0, y: 0 }, { x: 0, y: 0 }, { x: 100, y: 0 }]), null, 'duplicate points');
+  const f = m.addFloor([{ x: 0, y: 0 }, { x: 100, y: 0 }, { x: 100, y: 100 }, { x: 0, y: 100 }, { x: 0, y: 0 }]);
+  assert(f, 'added'); eq(f.points.length, 4, 'closing point dropped');
+  eq(f.level, m.activeLevel); eq(f.thickness, 20);
+  near(m.floorArea(f), 10000);
+  m.moveFloorVertex(f.id, 2, 200, 100);
+  nearPt(f.points[2], { x: 200, y: 100 });
+  near(m.floorArea(f), 15000);
+  m.moveFloor(f.id, 10, -10);
+  nearPt(f.points[0], { x: 10, y: -10 });
+  m.updateFloor(f.id, { thickness: 30 }); eq(f.thickness, 30);
+  assert(m.deleteEntity('floor', f.id)); eq(m.floors.length, 0);
+});
+
+test('stairs footprint, rotation and step count', () => {
+  const m = new Model();
+  const s = m.addStairs(100, 200); // 100 wide, 300 long, climbing towards +x
+  const fp = m.stairsFootprint(s);
+  nearPt(fp[0], { x: 100, y: 250 }); nearPt(fp[1], { x: 400, y: 250 });
+  nearPt(fp[2], { x: 400, y: 150 }); nearPt(fp[3], { x: 100, y: 150 });
+  let info = m.stairsInfo(s);
+  eq(info.rise, 270); eq(info.steps, 15); near(info.riser, 18);
+  m.updateStairs(s.id, { angle: 90 }); // turns about the footprint centre (250, 200)
+  eq(s.angle, 90);
+  nearPt(s, { x: 250, y: 50 });
+  const fp2 = m.stairsFootprint(s);
+  near(Math.max(...fp2.map((p) => p.y)) - Math.min(...fp2.map((p) => p.y)), 300, 'runs along y');
+  const l2 = m.addLevel();
+  m.updateLevel(l2.id, { height: 300 });
+  m.updateLevel(m.levels[0].id, { height: 290 });
+  info = m.stairsInfo(s);
+  eq(info.rise, 290, 'rise to the next level'); eq(info.steps, 16);
+  m.moveStairs(s.id, 10, 0); near(s.x, 260);
+  assert(m.deleteEntity('stairs', s.id)); eq(m.stairs.length, 0);
+});
+
+test('floorHoles cuts contained stairs from the level below only', () => {
+  const m = new Model();
+  const l1 = m.activeLevel;
+  m.addStairs(100, 100);           // footprint x 100..400, y 50..150: inside the upper floor
+  m.addStairs(550, 100);           // x 550..850: sticks out of the floor
+  const l2 = m.addLevel().id;
+  m.setActiveLevel(l2);
+  m.addStairs(200, 200);           // on the same level as the floor: no hole
+  const f = m.addFloor([{ x: 0, y: 0 }, { x: 600, y: 0 }, { x: 600, y: 400 }, { x: 0, y: 400 }]);
+  const holes = m.floorHoles(f);
+  eq(holes.length, 1, 'one hole');
+  nearPt(holes[0][0], { x: 100, y: 150 });
+  const g = m.addFloor([{ x: 0, y: 0 }, { x: 600, y: 0 }, { x: 600, y: 400 }], { level: l1 });
+  eq(m.floorHoles(g).length, 0, 'no level below the ground floor');
+  m.setActiveLevel(l1);
+  const flush = m.addStairs(0, 50, { level: l1 }); // footprint edge on the floor edge counts as inside
+  eq(m.floorHoles(f).length, 2);
+  assert(flush);
+});
+
+test('levels, floors and stairs survive toJSON / load', () => {
+  const m = createSampleModel();
+  const l2 = m.addLevel();
+  m.updateLevel(l2.id, { name: 'Attic', height: 240 });
+  m.setActiveLevel(l2.id);
+  m.addWall({ x: 0, y: 0 }, { x: 600, y: 0 });
+  m.addFloor([{ x: 0, y: 0 }, { x: 600, y: 0 }, { x: 600, y: 400 }, { x: 0, y: 400 }], { thickness: 25 });
+  m.addStairs(100, 100, { angle: 180, width: 90 });
+  const json = m.serialize();
+  const d = JSON.parse(json);
+  eq(d.version, 2);
+  eq(d.activeLevel, undefined, 'active level not serialised');
+  const m2 = new Model(json);
+  eq(m2.serialize(), json, 'round trip');
+  eq(m2.levels.length, 2); eq(m2.levels[1].name, 'Attic'); eq(m2.levelElevation(l2.id), 270);
+  eq(m2.floors.length, 2); eq(m2.floors[1].thickness, 25);
+  eq(m2.stairs[0].angle, 180); eq(m2.stairs[0].width, 90);
+  eq(m2.activeLevel, m2.levels[0].id, 'a fresh load starts on the first level');
+  const ids = [...m2.levels, ...m2.nodes, ...m2.walls, ...m2.openings, ...m2.floors, ...m2.stairs].map((e) => e.id);
+  const s = m2.addStairs(0, 0);
+  assert(!ids.includes(s.id), 'nextId past every loaded id');
+});
+
+test('activeLevel is not in undo snapshots', () => {
+  const m = new Model();
+  const h = new History(m);
+  const l1 = m.activeLevel;
+  const l2 = m.addLevel().id; h.commit();
+  m.setActiveLevel(l2);
+  eq(h.commit(), false, 'switching level is not an undo step');
+  m.addWall({ x: 0, y: 0 }, { x: 100, y: 0 }); h.commit();
+  h.undo();
+  eq(m.walls.length, 0); eq(m.activeLevel, l2, 'undo keeps the active level');
+  h.undo();
+  eq(m.levels.length, 1); eq(m.activeLevel, l1, 'falls back when the level is gone');
+  h.redo();
+  eq(m.activeLevel, l1, 'redo does not switch either');
 });
 
 /** Run every test. Returns { passed, failed, results: [{ name, ok, error }] }. */

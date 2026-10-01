@@ -7,6 +7,9 @@ import { openingDims, OPENING_TYPES } from './catalog.js';
 const FRAME = 5;       // window / door frame width, cm
 const LEAF = 4;        // door leaf thickness, cm
 const DOOR_OPEN = 65;  // degrees the door leaf is drawn open
+const FLOOR_LIFT = 0.5; // cm: floor slabs sit this far above their level so they don't z-fight the ground
+const GHOST_OPACITY = 0.18; // levels above the active one
+const LEVEL_ANIM_MS = 300;  // camera move when switching level
 
 export class View3D {
   constructor(container, model) {
@@ -16,6 +19,8 @@ export class View3D {
     this.needsRender = true;
     this._rebuildQueued = false;
     this._fittedOnce = false;
+    this._camElev = model.levelElevation(model.activeLevel); // elevation the camera is framed on
+    this._levelAnim = null;
 
     const renderer = new THREE.WebGLRenderer({ antialias: true });
     renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
@@ -69,7 +74,19 @@ export class View3D {
       glass: new THREE.MeshPhysicalMaterial({
         color: 0x9fd0ea, roughness: 0.05, metalness: 0, transparent: true, opacity: 0.35, depthWrite: false,
       }),
+      floor: new THREE.MeshStandardMaterial({ color: 0xd8c8a8, roughness: 0.85 }),
+      stairs: new THREE.MeshStandardMaterial({ color: 0xc9b08a, roughness: 0.75 }),
     };
+    // Levels above the active one: see-through copies that neither write depth nor cast shadows.
+    this.ghostMats = {};
+    for (const [k, mat] of Object.entries(this.mats)) {
+      const g = mat.clone();
+      g.transparent = true;
+      g.opacity = mat.transparent ? mat.opacity * GHOST_OPACITY : GHOST_OPACITY;
+      g.depthWrite = false;
+      g.userData.ghost = true;
+      this.ghostMats[k] = g;
+    }
 
     this.plan = new THREE.Group();
     scene.add(this.plan);
@@ -82,6 +99,7 @@ export class View3D {
 
     const loop = () => {
       requestAnimationFrame(loop);
+      this.stepLevelAnim();
       const moved = this.controls.update();
       if ((moved || this.needsRender) && this.width && this.height) {
         this.needsRender = false;
@@ -94,6 +112,36 @@ export class View3D {
   setSelection(sel) {
     this.selection = sel;
     this.scheduleRebuild();
+  }
+
+  /** Follow a level switch: move the camera and its target up or down by the change in elevation. */
+  setActiveLevel(id) {
+    const elev = this.model.levelElevation(id);
+    const prev = this._levelAnim;
+    // Finish what is left of a move that is still running.
+    const leftover = prev ? prev.dy - prev.applied : 0;
+    const dy = elev - this._camElev + leftover;
+    this._camElev = elev;
+    this._levelAnim = Math.abs(dy) > 0.01 ? { dy, applied: 0, start: performance.now() } : null;
+    if (!this._levelAnim && leftover) this.shiftCamera(leftover);
+    this.scheduleRebuild();
+  }
+
+  shiftCamera(dy) {
+    this.camera.position.y += dy;
+    this.controls.target.y += dy;
+    this.needsRender = true;
+  }
+
+  stepLevelAnim() {
+    const a = this._levelAnim;
+    if (!a) return;
+    const t = Math.min(1, (performance.now() - a.start) / LEVEL_ANIM_MS);
+    const eased = t < 0.5 ? 2 * t * t : 1 - (-2 * t + 2) ** 2 / 2;
+    const target = a.dy * eased;
+    this.shiftCamera(target - a.applied);
+    a.applied = target;
+    if (t >= 1) this._levelAnim = null;
   }
 
   resize() {
@@ -119,13 +167,17 @@ export class View3D {
     });
   }
 
-  /** Point the camera at the whole plan. */
+  /** Point the camera at the active level (or the whole plan if that level is empty). */
   fit() {
-    const b = this.model.bounds();
+    const m = this.model;
+    const b = m.bounds(m.activeLevel) || m.bounds();
     const cx = b ? (b.minX + b.maxX) / 2 : 0, cz = b ? (b.minY + b.maxY) / 2 : 0;
     const size = b ? Math.max(b.maxX - b.minX, b.maxY - b.minY, 300) : 800;
     const hgt = b ? b.maxHeight : 270;
-    const target = new THREE.Vector3(cx, hgt * 0.3, cz);
+    const elev = m.levelElevation(m.activeLevel);
+    this._levelAnim = null;
+    this._camElev = elev;
+    const target = new THREE.Vector3(cx, elev + hgt * 0.3, cz);
     const fov = THREE.MathUtils.degToRad(this.camera.fov);
     const d = (size * 0.75) / Math.tan(fov / 2) / Math.min(1, Math.max(this.camera.aspect, 0.5));
     const dir = new THREE.Vector3(0.45, 0.85, 1).normalize();
@@ -146,17 +198,32 @@ export class View3D {
     if (len <= 0.01 || h <= 0.01 || depth <= 0.01) return null;
     const mesh = new THREE.Mesh(new THREE.BoxGeometry(len, h, depth), mat);
     mesh.position.set((x0 + x1) / 2, (y0 + y1) / 2, z);
-    mesh.castShadow = shadow;
-    mesh.receiveShadow = true;
+    mesh.castShadow = shadow && !mat.userData.ghost;
+    mesh.receiveShadow = !mat.userData.ghost;
     parent.add(mesh);
     return mesh;
   }
 
+  /** One group per level at its elevation. Levels above the active one use the see-through materials. */
   rebuild() {
     this.clearPlan();
     const m = this.model;
+    const active = m.levelIndex(m.activeLevel);
+    m.levels.forEach((level, i) => {
+      const g = new THREE.Group();
+      g.position.y = m.levelElevation(level.id);
+      this.plan.add(g);
+      this.buildLevel(g, level, i > active ? this.ghostMats : this.mats);
+    });
+    this.updateSun();
+    this.needsRender = true;
+  }
+
+  buildLevel(parent, level, mats) {
+    const m = this.model;
     const sel = this.selection;
     for (const w of m.walls) {
+      if (w.level !== level.id) continue;
       const { a, b } = m.wallEnds(w);
       const L = Math.hypot(b.x - a.x, b.y - a.y);
       if (L < 0.01) continue;
@@ -165,7 +232,7 @@ export class View3D {
       const g = new THREE.Group();
       g.position.set(a.x, 0, a.y);
       g.rotation.y = -angle;
-      this.plan.add(g);
+      parent.add(g);
 
       // Extend into joined corners by half the thickness of the neighbouring walls.
       const ext = (nodeId) => {
@@ -174,7 +241,7 @@ export class View3D {
       };
       const extA = ext(w.a), extB = ext(w.b);
       const T = w.thickness, H = w.height;
-      const wallMat = sel?.kind === 'wall' && sel.id === w.id ? this.mats.wallSel : this.mats.wall;
+      const wallMat = sel?.kind === 'wall' && sel.id === w.id ? mats.wallSel : mats.wall;
 
       const ops = m.openingsOnWall(w.id)
         .map((o) => ({ o, s0: Math.max(0, o.t - o.width / 2), s1: Math.min(L, o.t + o.width / 2), ...openingDims(o.type, H) }))
@@ -191,19 +258,49 @@ export class View3D {
         }
         cursor = Math.max(cursor, op.s1);
         const selected = sel?.kind === 'opening' && sel.id === op.o.id;
-        this.addFiller(g, op, T, selected);
+        this.addFiller(g, op, T, selected, mats);
       }
       if (L + extB > cursor) this.box(g, cursor, L + extB, 0, H, T, wallMat);
     }
-    this.updateSun();
-    this.needsRender = true;
+    for (const f of m.floors) {
+      if (f.level === level.id) this.addFloor(parent, f, sel?.kind === 'floor' && sel.id === f.id ? mats.wallSel : mats.floor);
+    }
+    for (const st of m.stairs) {
+      if (st.level === level.id) this.addStairs(parent, st, sel?.kind === 'stairs' && sel.id === st.id ? mats.wallSel : mats.stairs);
+    }
   }
 
-  addFiller(g, op, T, selected) {
+  /** Floor slab: the plan polygon (y -> world z) with stairwell holes, extruded downwards from the level. */
+  addFloor(parent, f, mat) {
+    const shape = new THREE.Shape(f.points.map((p) => new THREE.Vector2(p.x, p.y)));
+    for (const h of this.model.floorHoles(f)) shape.holes.push(new THREE.Path(h.map((p) => new THREE.Vector2(p.x, p.y))));
+    const geo = new THREE.ExtrudeGeometry(shape, { depth: f.thickness, bevelEnabled: false });
+    const mesh = new THREE.Mesh(geo, mat);
+    // Rotating +90 deg about x maps shape (x, y, z) to world (x, -z, y): the slab spans -thickness..0.
+    mesh.rotation.x = Math.PI / 2;
+    mesh.position.y = FLOOR_LIFT;
+    mesh.castShadow = !mat.userData.ghost;
+    mesh.receiveShadow = !mat.userData.ghost;
+    parent.add(mesh);
+  }
+
+  /** Stairs as a stepped solid: one box per step, each from the floor up to its tread. */
+  addStairs(parent, st, mat) {
+    const { steps, riser, going } = this.model.stairsInfo(st);
+    const u = this.model.stairsDir(st);
+    // Local frame like a wall: x up the flight from (x, y), y up, z across the width.
+    const g = new THREE.Group();
+    g.position.set(st.x, 0, st.y);
+    g.rotation.y = -Math.atan2(u.y, u.x);
+    parent.add(g);
+    for (let i = 0; i < steps; i++) this.box(g, i * going, (i + 1) * going, 0, (i + 1) * riser, st.width, mat);
+  }
+
+  addFiller(g, op, T, selected, mats = this.mats) {
     const { o, s0, s1, sill, top } = op;
     const kind = OPENING_TYPES[o.type].kind;
     if (kind === 'door') {
-      const fm = selected ? this.mats.sel : this.mats.doorFrame;
+      const fm = selected ? mats.sel : mats.doorFrame;
       const fw = Math.min(FRAME, (s1 - s0) / 4);
       this.box(g, s0, s0 + fw, sill, top, T, fm);
       this.box(g, s1 - fw, s1, sill, top, T, fm);
@@ -218,9 +315,9 @@ export class View3D {
       const hingeSign = hingeAtEnd ? -1 : 1;
       pivot.rotation.y = -side * hingeSign * THREE.MathUtils.degToRad(DOOR_OPEN);
       g.add(pivot);
-      this.box(pivot, hingeSign > 0 ? 0 : -leafW, hingeSign > 0 ? leafW : 0, 0, leafH, LEAF, selected ? this.mats.sel : this.mats.leaf);
+      this.box(pivot, hingeSign > 0 ? 0 : -leafW, hingeSign > 0 ? leafW : 0, 0, leafH, LEAF, selected ? mats.sel : mats.leaf);
     } else {
-      const fm = selected ? this.mats.sel : this.mats.frame;
+      const fm = selected ? mats.sel : mats.frame;
       const fw = Math.min(FRAME, (s1 - s0) / 4, (top - sill) / 4);
       this.box(g, s0, s0 + fw, sill, top, T, fm);
       this.box(g, s1 - fw, s1, sill, top, T, fm);
@@ -231,20 +328,23 @@ export class View3D {
         const mid = (s0 + s1) / 2;
         this.box(g, mid - fw / 2, mid + fw / 2, sill + fw, top - fw, Math.min(T, 8), fm);
       }
-      this.box(g, s0 + fw, s1 - fw, sill + fw, top - fw, 1, this.mats.glass, 0, { shadow: false });
+      this.box(g, s0 + fw, s1 - fw, sill + fw, top - fw, 1, mats.glass, 0, { shadow: false });
     }
   }
 
+  /** Sun and shadow camera sized to every level. */
   updateSun() {
-    const b = this.model.bounds();
+    const m = this.model;
+    const b = m.bounds();
     const cx = b ? (b.minX + b.maxX) / 2 : 0, cz = b ? (b.minY + b.maxY) / 2 : 0;
     const size = b ? Math.max(b.maxX - b.minX, b.maxY - b.minY, 400) : 1000;
-    this.sun.position.set(cx + size * 0.6, size * 1.2 + 600, cz + size * 0.9);
+    const top = m.levels.reduce((sum, l) => sum + l.height, 0);
+    this.sun.position.set(cx + size * 0.6, size * 1.2 + 600 + top, cz + size * 0.9);
     this.sun.target.position.set(cx, 0, cz);
     const cam = this.sun.shadow.camera;
     const r = size * 0.9 + 300;
     cam.left = -r; cam.right = r; cam.top = r; cam.bottom = -r;
-    cam.near = 10; cam.far = size * 4 + 3000;
+    cam.near = 10; cam.far = size * 4 + 3000 + top * 2;
     cam.updateProjectionMatrix();
   }
 }

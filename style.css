@@ -23,6 +23,7 @@
   --plan-glass: #cfe8f6;
   --plan-glass-edge: #2b7bb0;
   --plan-pill: rgba(255, 255, 255, 0.92);
+  --plan-floor: #efe9dd;
 
   color-scheme: light;
 }
@@ -51,6 +52,7 @@
     --plan-glass: #24465c;
     --plan-glass-edge: #6cb6e6;
     --plan-pill: rgba(31, 34, 38, 0.92);
+    --plan-floor: #25282d;
     color-scheme: dark;
   }
 }
@@ -119,6 +121,18 @@ button.active:hover:not(:disabled), button[aria-pressed="true"]:hover:not(:disab
 }
 button.danger { color: var(--danger); }
 button.danger:hover { background: rgba(220, 38, 38, 0.1); }
+
+.toolbar select {
+  font: inherit;
+  color: var(--text);
+  background: var(--btn);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 4px 6px;
+  max-width: 160px;
+  cursor: pointer;
+}
+.toolbar select:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 
 kbd {
   font: 10px ui-monospace, monospace;

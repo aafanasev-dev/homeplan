@@ -1,14 +1,16 @@
 // 2D plan editor: canvas rendering, pan/zoom, tools, hit-testing and drag logic.
 
 import {
-  GRID, EPS, add, sub, scale, dist, perp, snap, snapPoint, clamp, angleOf, round,
+  GRID, EPS, add, sub, scale, dist, perp, snap, snapPoint, clamp, angleOf, round, pointInPolygon, polygonArea,
 } from './geometry.js';
 import { computeWallPolygons } from './model.js';
-import { OPENING_TYPES } from './catalog.js';
+import { OPENING_TYPES, STAIR_DEFAULTS } from './catalog.js';
 
 const OPENING_SNAP_DIST = 40; // cm: how close the cursor must be to a wall to place an opening
 const DRAG_THRESHOLD = 3;     // px before a press becomes a drag
 const MIN_SCALE = 0.03, MAX_SCALE = 12; // px per cm
+const CLOSE_DIST = 10;        // px: clicking this close to a floor's first point closes it
+const GHOST_ALPHA = 0.3;      // opacity of the level below
 
 export const TOOLS = {
   select:      { label: 'Select',             key: 'v', hint: 'Click to select, drag to move. Double-click a wall to split it. Drag empty space to pan.' },
@@ -18,6 +20,8 @@ export const TOOLS = {
   window_tall: { label: 'Tall window',        key: '2', opening: 'window_tall' },
   window_full: { label: 'Full-height window', key: '3', opening: 'window_full' },
   split:       { label: 'Split',              key: 's', hint: 'Click on a wall to split it into two segments.' },
+  floor:       { label: 'Floor',              key: 'g', hint: 'Click to add corners. Click the first corner, double-click or press Enter to close; Esc cancels. Shift keeps edges straight.' },
+  stairs:      { label: 'Stairs',             key: 't', hint: 'Click to place a flight climbing to the right; rotate it from its menu. It cuts a stairwell in the floor above.' },
 };
 
 const fmtM = (cm) => `${round(cm / 100, 2).toFixed(2)} m`;
@@ -43,10 +47,12 @@ export class Editor2D {
     this.dpr = 1;
 
     this.tool = 'select';
-    this.selection = null; // { kind: 'node'|'wall'|'opening', id }
+    this.selection = null; // { kind: 'node'|'wall'|'opening'|'floor'|'stairs', id }
     this.hover = null;
     this.drag = null;
     this.chain = null;     // wall tool: { last: {x,y}, start: {x,y}, count }
+    this.floorDraw = null; // floor tool: { points: [{x,y}] }
+    this.stairGhost = null; // stairs tool preview: { x, y }
     this.ghost = null;     // opening tool preview
     this.splitPreview = null;
     this.cursor = null;    // world position of the mouse
@@ -84,6 +90,7 @@ export class Editor2D {
       invalid: v('--danger', '#dc2626'),
       text: v('--plan-text', '#1f2329'),
       pill: v('--plan-pill', 'rgba(255,255,255,0.9)'),
+      floor: v('--plan-floor', '#efe9dd'),
     };
   }
 
@@ -116,8 +123,9 @@ export class Editor2D {
     this.render();
   }
 
+  /** Frame the active level (or every level if it is empty). */
   fit() {
-    const b = this.model.bounds();
+    const b = this.model.bounds(this.model.activeLevel) || this.model.bounds();
     if (!b || !this.cssW) return;
     const pad = 70;
     const bw = Math.max(b.maxX - b.minX, 100), bh = Math.max(b.maxY - b.minY, 100);
@@ -141,9 +149,11 @@ export class Editor2D {
   setTool(tool) {
     if (!TOOLS[tool]) return;
     this.endChain();
+    this.floorDraw = null;
     this.tool = tool;
     this.ghost = null;
     this.splitPreview = null;
+    this.stairGhost = null;
     this.hideMenu();
     this.updateCursorStyle();
     this.opts.onToolChange?.(tool);
@@ -161,11 +171,12 @@ export class Editor2D {
     this.requestRender();
   }
 
-  /** Esc: end the wall chain, then leave the tool, then clear the selection. */
+  /** Esc: end the wall chain (or drop the floor being drawn), then leave the tool, then clear the selection. */
   cancel() {
     this.hideMenu();
     if (this.drag) return;
     if (this.chain) { this.endChain(); this.requestRender(); return; }
+    if (this.floorDraw) { this.floorDraw = null; this.requestRender(); return; }
     if (this.tool !== 'select') { this.setTool('select'); return; }
     this.setSelection(null);
   }
@@ -177,6 +188,15 @@ export class Editor2D {
   onModelChange() {
     if (this.selection && !this.model.getEntity(this.selection.kind, this.selection.id)) this.setSelection(null);
     this.requestRender();
+  }
+
+  /** The active level changed: drop anything in progress and the selection, which belong to the old level. */
+  onLevelChange() {
+    this.hideMenu();
+    this.endChain();
+    this.floorDraw = null;
+    this.setSelection(null);
+    this.refreshPreview();
   }
 
   requestRender() {
@@ -213,10 +233,14 @@ export class Editor2D {
     ];
   }
 
-  /** Priority: opening resize handles, openings, nodes, walls. */
+  /**
+   * Only the active level is hit. Priority: opening resize handles, floor vertex handles of the
+   * selected floor, openings, nodes, walls, stairs, floors.
+   */
   hitTest(screen) {
     const p = this.s2w(screen);
     const m = this.model;
+    const L = m.activeLevel;
     if (this.selection?.kind === 'opening') {
       const o = m.getOpening(this.selection.id);
       if (o) {
@@ -225,10 +249,18 @@ export class Editor2D {
         }
       }
     }
+    if (this.selection?.kind === 'floor') {
+      const f = m.getFloor(this.selection.id);
+      if (f) {
+        for (let i = 0; i < f.points.length; i++) {
+          if (dist(this.w2s(f.points[i]), screen) <= 8) return { kind: 'floorVertex', id: f.id, index: i };
+        }
+      }
+    }
     let best = null, bestD = Infinity;
     for (const o of m.openings) {
       const w = m.getWall(o.wallId);
-      if (!w) continue;
+      if (!w || w.level !== L) continue;
       const proj = m.projectOnWall(w, p);
       if (Math.abs(proj.along - o.t) <= o.width / 2 && proj.dist <= w.thickness / 2 + this.px(4) && proj.dist < bestD) {
         best = { kind: 'opening', id: o.id }; bestD = proj.dist;
@@ -236,6 +268,7 @@ export class Editor2D {
     }
     if (best) return best;
     for (const n of m.nodes) {
+      if (n.level !== L) continue;
       const maxHalf = Math.max(0, ...m.wallsAtNode(n.id).map((w) => w.thickness / 2));
       const r = Math.max(this.px(8), Math.min(maxHalf, this.px(20)));
       const d = dist(n, p);
@@ -243,11 +276,24 @@ export class Editor2D {
     }
     if (best) return best;
     for (const w of m.walls) {
+      if (w.level !== L) continue;
       const proj = m.projectOnWall(w, p);
       if (proj.rawT < -0.001 || proj.rawT > 1.001) continue;
       if (proj.dist <= w.thickness / 2 + this.px(3) && proj.dist < bestD) { best = { kind: 'wall', id: w.id }; bestD = proj.dist; }
     }
-    return best;
+    if (best) return best;
+    // Stairs and floors: the last drawn is on top.
+    for (let i = m.stairs.length - 1; i >= 0; i--) {
+      const st = m.stairs[i];
+      if (st.level === L && pointInPolygon(p, m.stairsFootprint(st))) return { kind: 'stairs', id: st.id };
+    }
+    for (let i = m.floors.length - 1; i >= 0; i--) {
+      const f = m.floors[i];
+      if (f.level !== L || !pointInPolygon(p, f.points)) continue;
+      if (m.floorHoles(f).some((h) => pointInPolygon(p, h))) continue; // in the stairwell
+      return { kind: 'floor', id: f.id };
+    }
+    return null;
   }
 
   /** Wall under the cursor for the split tool (generous tolerance). */
@@ -266,7 +312,7 @@ export class Editor2D {
     c.addEventListener('pointermove', (e) => this.onPointerMove(e));
     c.addEventListener('pointerup', (e) => this.onPointerUp(e));
     c.addEventListener('pointercancel', (e) => this.onPointerUp(e, true));
-    c.addEventListener('pointerleave', () => { if (!this.drag) { this.cursor = null; this.hover = null; this.ghost = null; this.splitPreview = null; this.requestRender(); } });
+    c.addEventListener('pointerleave', () => { if (!this.drag) { this.cursor = null; this.hover = null; this.ghost = null; this.splitPreview = null; this.stairGhost = null; this.requestRender(); } });
     c.addEventListener('dblclick', (e) => this.onDoubleClick(e));
     c.addEventListener('wheel', (e) => {
       e.preventDefault();
@@ -327,6 +373,10 @@ export class Editor2D {
         this.startDrag(e, { kind: 'handle', id: hit.id, end: hit.end });
         return;
       }
+      if (hit.kind === 'floorVertex') {
+        this.startDrag(e, { kind: 'floorVertex', id: hit.id, index: hit.index });
+        return;
+      }
       this.setSelection({ kind: hit.kind, id: hit.id });
       if (hit.kind === 'node') this.startDrag(e, { kind: 'node', id: hit.id });
       else if (hit.kind === 'wall') {
@@ -336,11 +386,26 @@ export class Editor2D {
         const o = this.model.getOpening(hit.id);
         const proj = this.model.projectOnWall(o.wallId, p);
         this.startDrag(e, { kind: 'opening', id: hit.id, grabWall: o.wallId, grabOffset: proj.along - o.t });
+      } else if (hit.kind === 'floor') {
+        const f0 = this.model.getFloor(hit.id).points[0];
+        this.startDrag(e, { kind: 'floor', id: hit.id, start: p, orig: { x: f0.x, y: f0.y } });
+      } else if (hit.kind === 'stairs') {
+        const st = this.model.getStairs(hit.id);
+        this.startDrag(e, { kind: 'stairs', id: hit.id, start: p, orig: { x: st.x, y: st.y } });
       }
       return;
     }
 
     if (this.tool === 'wall') { this.wallClick(p); return; }
+    if (this.tool === 'floor') { this.floorClick(p); return; }
+
+    if (this.tool === 'stairs') {
+      const q = this.snapDraw(p);
+      const st = this.model.addStairs(q.x, q.y);
+      if (st) { this.commit(); this.setSelection({ kind: 'stairs', id: st.id }); }
+      this.refreshPreview();
+      return;
+    }
 
     if (TOOLS[this.tool].opening) {
       const g = this.computeGhost(p);
@@ -384,9 +449,10 @@ export class Editor2D {
   refreshPreview() {
     if (!this.cursorScreen) { this.requestRender(); return; }
     const p = this.cursor;
-    this.hover = null; this.ghost = null; this.splitPreview = null;
+    this.hover = null; this.ghost = null; this.splitPreview = null; this.stairGhost = null;
     if (this.tool === 'select') this.hover = this.hitTest(this.cursorScreen);
     else if (TOOLS[this.tool].opening) this.ghost = this.computeGhost(p);
+    else if (this.tool === 'stairs') this.stairGhost = this.snapDraw(p);
     else if (this.tool === 'split') {
       const hit = this.wallAt(p);
       if (hit) {
@@ -421,6 +487,24 @@ export class Editor2D {
         const { a } = m.wallEnds(d.id);
         const dx = d.origA.x + sd.x - a.x, dy = d.origA.y + sd.y - a.y;
         if (Math.abs(dx) > EPS || Math.abs(dy) > EPS) m.moveWall(d.id, dx, dy);
+        break;
+      }
+      case 'floor':
+      case 'stairs': {
+        // Move so the anchor (first floor point / stair start) lands on orig + snapped delta.
+        const delta = sub(p, d.start);
+        const sd = this.keys.alt ? delta : snapPoint(delta, GRID);
+        const cur = d.kind === 'floor' ? m.getFloor(d.id)?.points[0] : m.getStairs(d.id);
+        if (!cur) break;
+        const dx = d.orig.x + sd.x - cur.x, dy = d.orig.y + sd.y - cur.y;
+        if (Math.abs(dx) > EPS || Math.abs(dy) > EPS) {
+          if (d.kind === 'floor') m.moveFloor(d.id, dx, dy); else m.moveStairs(d.id, dx, dy);
+        }
+        break;
+      }
+      case 'floorVertex': {
+        const q = this.snapDraw(p);
+        m.moveFloorVertex(d.id, d.index, q.x, q.y);
         break;
       }
       case 'opening': this.dragOpening(d, p); break;
@@ -483,6 +567,7 @@ export class Editor2D {
   onDoubleClick(e) {
     this.updatePointer(e);
     if (this.tool === 'wall') { this.endChain(); this.requestRender(); return; }
+    if (this.tool === 'floor') { this.finishFloor(); return; }
     if (this.tool !== 'select') return;
     const hit = this.hitTest(this.cursorScreen);
     if (hit?.kind === 'wall') {
@@ -495,7 +580,9 @@ export class Editor2D {
     e.preventDefault();
     this.updatePointer(e);
     if (this.tool === 'wall' && this.chain) { this.endChain(); this.requestRender(); return; }
-    const hit = this.hitTest(this.cursorScreen);
+    if (this.tool === 'floor' && this.floorDraw) { this.finishFloor(); return; }
+    let hit = this.hitTest(this.cursorScreen);
+    if (hit?.kind === 'floorVertex') hit = { kind: 'floor', id: hit.id };
     if (!hit || hit.kind === 'handle') { this.hideMenu(); return; }
     if (this.tool !== 'select') this.setTool('select');
     this.setSelection({ kind: hit.kind, id: hit.id });
@@ -513,6 +600,7 @@ export class Editor2D {
       items.push({ label: 'Flip hinge', action: () => this.flipDoor(hit.id, 1) });
       items.push({ label: 'Flip side', action: () => this.flipDoor(hit.id, 2) });
     }
+    if (hit.kind === 'stairs') items.push({ label: 'Rotate 90°', action: () => this.rotateStairs(hit.id) });
     items.push({ label: 'Delete', danger: true, action: () => this.deleteSelection() });
     this.showMenu(this.cursorScreen, items);
   }
@@ -546,11 +634,18 @@ export class Editor2D {
     this.commit();
   }
 
+  rotateStairs(id) {
+    const st = this.model.getStairs(id);
+    if (!st) return;
+    this.model.updateStairs(id, { angle: st.angle + 90 });
+    this.commit();
+  }
+
   // ---------------------------------------------------------------- wall tool
 
   wallClick(raw) {
     let p = this.snapDraw(raw);
-    if (this.chain && this.keys.shift && !p.node) p = this.constrain(p);
+    if (this.chain && this.keys.shift && !p.node) p = this.constrain(p, this.chain.last);
     if (!this.chain) {
       this.chain = { start: { x: p.x, y: p.y }, last: { x: p.x, y: p.y }, count: 0 };
       this.requestRender();
@@ -558,7 +653,8 @@ export class Editor2D {
     }
     if (dist(p, this.chain.last) < 0.5) return; // second click of a double-click
     const r = Math.max(this.nodeSnapRadius(), 0.5);
-    const w = this.model.addWall(this.chain.last, p, { snapRadius: r, splitWalls: true });
+    const level = this.model.getLevel(this.model.activeLevel);
+    const w = this.model.addWall(this.chain.last, p, { snapRadius: r, splitWalls: true, height: level?.height });
     if (!w) return;
     this.commit();
     const endNode = this.model.nodeNear(p, r);
@@ -569,13 +665,49 @@ export class Editor2D {
     this.requestRender();
   }
 
-  /** Shift: keep the segment horizontal or vertical. */
-  constrain(p) {
-    const l = this.chain.last;
+  /** Shift: keep the segment from l to p horizontal or vertical. */
+  constrain(p, l) {
     return Math.abs(p.x - l.x) >= Math.abs(p.y - l.y) ? { x: p.x, y: l.y } : { x: l.x, y: p.y };
   }
 
   endChain() { this.chain = null; }
+
+  // ---------------------------------------------------------------- floor tool
+
+  /** Next floor corner for the cursor: snapped, Shift-constrained, or the first corner when closing. */
+  floorPoint(raw) {
+    const pts = this.floorDraw?.points;
+    if (pts && pts.length >= 3 && dist(this.w2s(pts[0]), this.w2s(raw)) <= CLOSE_DIST) return { ...pts[0], close: true };
+    let p = this.snapDraw(raw);
+    if (pts?.length && this.keys.shift && !p.node) p = this.constrain(p, pts[pts.length - 1]);
+    return p;
+  }
+
+  floorClick(raw) {
+    const p = this.floorPoint(raw);
+    if (!this.floorDraw) {
+      this.floorDraw = { points: [{ x: p.x, y: p.y }] };
+      this.requestRender();
+      return;
+    }
+    if (p.close) { this.finishFloor(); return; }
+    const pts = this.floorDraw.points;
+    if (dist(p, pts[pts.length - 1]) < 0.5) return; // second click of a double-click
+    pts.push({ x: p.x, y: p.y });
+    this.requestRender();
+  }
+
+  /** Close the floor being drawn. Returns true if a floor drawing was in progress. */
+  finishFloor() {
+    const fd = this.floorDraw;
+    if (!fd) return false;
+    this.floorDraw = null;
+    const f = fd.points.length >= 3 ? this.model.addFloor(fd.points) : null;
+    if (f) { this.commit(); this.setSelection({ kind: 'floor', id: f.id }); }
+    else if (fd.points.length > 1) this.opts.onStatus?.('A floor needs at least 3 corners and some area.');
+    this.requestRender();
+    return true;
+  }
 
   // ---------------------------------------------------------------- opening tool
 
@@ -628,7 +760,14 @@ export class Editor2D {
         ? (this.ghost.wallId ? 'No room on this wall.' : 'Move near a wall to place it.')
         : `Click to place a ${tool.label.toLowerCase()} on the wall. Esc returns to Select.`;
     }
+    if (this.tool === 'floor' && this.floorDraw) {
+      const pts = this.floorDraw.points;
+      hint = pts.length >= 3
+        ? `${pts.length} corners. Click the first corner, double-click or press Enter to close. Esc cancels.`
+        : `${pts.length} corner${pts.length === 1 ? '' : 's'}. Keep clicking to add corners. Esc cancels.`;
+    }
     if (this.drag?.kind === 'handle') hint = 'Drag to resize. Shift anchors the opposite edge. Alt disables snapping.';
+    else if (this.drag?.kind === 'floorVertex') hint = 'Drag the corner. It snaps to wall corners and the grid; Alt disables snapping.';
     else if (this.drag?.kind === 'opening') hint = 'Slide along the wall, or move close to another wall to jump onto it.';
     if (hint) parts.push(hint);
     this.opts.onStatus?.(parts.join('   ·   '));
@@ -656,13 +795,25 @@ export class Editor2D {
     this.drawGrid();
 
     const m = this.model;
-    const polys = computeWallPolygons(m);
+    const L = m.activeLevel;
     const sel = this.selection, hov = this.hover;
     const isSel = (kind, id) => sel && sel.kind === kind && sel.id === id;
     const isHov = (kind, id) => hov && hov.kind === kind && hov.id === id;
+    const state = (kind, id) => (isSel(kind, id) ? 'selected' : isHov(kind, id) ? 'hover' : null);
+
+    // The level below shows faintly; levels above are never drawn.
+    const below = m.levelBelow(L);
+    if (below) this.drawLevelGhost(below.id);
+
+    // Floors are opaque, so they cover the level below wherever this level has a floor.
+    for (const f of m.floors) if (f.level === L) this.drawFloor(f, state('floor', f.id));
+    for (const st of m.stairs) if (st.level === L) this.drawStairs(st, state('stairs', st.id));
+
+    const walls = m.walls.filter((w) => w.level === L);
+    const polys = computeWallPolygons(m, L);
 
     // Walls: fill, then outline the long edges and the free ends only (so joins look seamless).
-    for (const w of m.walls) {
+    for (const w of walls) {
       const pg = polys.get(w.id);
       if (!pg) continue;
       const pts = [pg.aPlus, pg.bPlus, pg.bMinus, pg.aMinus].map((q) => this.w2s(q));
@@ -674,7 +825,7 @@ export class Editor2D {
     }
     ctx.lineWidth = 1;
     ctx.strokeStyle = this.c.wallEdge;
-    for (const w of m.walls) {
+    for (const w of walls) {
       const pg = polys.get(w.id);
       const [ap, bp, bm, am] = [pg.aPlus, pg.bPlus, pg.bMinus, pg.aMinus].map((q) => this.w2s(q));
       ctx.beginPath();
@@ -687,17 +838,17 @@ export class Editor2D {
 
     for (const o of m.openings) {
       const w = m.getWall(o.wallId);
-      if (!w) continue;
-      const state = isSel('opening', o.id) ? 'selected' : isHov('opening', o.id) ? 'hover' : null;
-      this.drawOpening(w, o.type, o.t, o.width, o.swing || 0, state);
+      if (!w || w.level !== L) continue;
+      this.drawOpening(w, o.type, o.t, o.width, o.swing || 0, state('opening', o.id));
     }
 
     // Wall length labels.
-    for (const w of m.walls) this.drawWallLength(w, polys.get(w.id), isSel('wall', w.id));
+    for (const w of walls) this.drawWallLength(w, polys.get(w.id), isSel('wall', w.id));
 
     // Nodes: shown for the selection, hover, and in drawing tools as snap targets.
     const showAllNodes = this.tool === 'wall' || this.tool === 'select';
     for (const n of m.nodes) {
+      if (n.level !== L) continue;
       const s = this.w2s(n);
       const selected = isSel('node', n.id);
       const hovered = isHov('node', n.id);
@@ -737,10 +888,143 @@ export class Editor2D {
       }
     }
 
+    // Floor corner handles.
+    if (sel?.kind === 'floor') {
+      const f = m.getFloor(sel.id);
+      if (f) {
+        f.points.forEach((q, i) => {
+          const s = this.w2s(q);
+          const hot = hov?.kind === 'floorVertex' && hov.id === f.id && hov.index === i;
+          ctx.fillStyle = hot ? this.c.accent : '#ffffff';
+          ctx.strokeStyle = this.c.accent;
+          ctx.lineWidth = 2;
+          ctx.fillRect(s.x - 4.5, s.y - 4.5, 9, 9);
+          ctx.strokeRect(s.x - 4.5, s.y - 4.5, 9, 9);
+        });
+      }
+    }
+
     // Tool previews.
     if (this.tool === 'wall') this.drawWallPreview();
+    if (this.tool === 'floor') this.drawFloorPreview();
+    if (this.stairGhost) {
+      this.drawStairs({ ...STAIR_DEFAULTS, x: this.stairGhost.x, y: this.stairGhost.y, angle: 0, level: L }, 'ghost');
+    }
     if (this.ghost) this.drawGhost(this.ghost);
     if (this.splitPreview) this.drawSplitPreview(this.splitPreview);
+  }
+
+  /** A level drawn faintly under the active one: walls, openings, stairs and floor outlines, no labels. */
+  drawLevelGhost(level) {
+    const m = this.model, ctx = this.ctx;
+    ctx.save();
+    ctx.globalAlpha = GHOST_ALPHA;
+    ctx.setLineDash([6, 4]);
+    for (const f of m.floors) {
+      if (f.level !== level) continue;
+      ctx.beginPath();
+      this.tracePolygon(f.points);
+      ctx.strokeStyle = this.c.wallEdge;
+      ctx.lineWidth = 1;
+      ctx.stroke();
+    }
+    ctx.setLineDash([]);
+    for (const st of m.stairs) if (st.level === level) this.drawStairs(st, null, { label: false });
+    const polys = computeWallPolygons(m, level);
+    for (const w of m.walls) {
+      const pg = polys.get(w.id);
+      if (pg) this.poly([pg.aPlus, pg.bPlus, pg.bMinus, pg.aMinus].map((q) => this.w2s(q)), this.c.wall);
+    }
+    for (const o of m.openings) {
+      const w = m.getWall(o.wallId);
+      if (w && w.level === level) this.drawOpening(w, o.type, o.t, o.width, o.swing || 0, null);
+    }
+    ctx.restore();
+  }
+
+  /** Add a closed polygon (world points) to the current path. */
+  tracePolygon(pts) {
+    const ctx = this.ctx;
+    pts.forEach((q, i) => { const s = this.w2s(q); if (i) ctx.lineTo(s.x, s.y); else ctx.moveTo(s.x, s.y); });
+    ctx.closePath();
+  }
+
+  /** Floor slab: opaque fill with stairwell holes cut out (even-odd). state: null | 'hover' | 'selected'. */
+  drawFloor(f, state) {
+    const ctx = this.ctx;
+    ctx.beginPath();
+    this.tracePolygon(f.points);
+    for (const h of this.model.floorHoles(f)) this.tracePolygon(h);
+    ctx.fillStyle = this.c.floor;
+    ctx.fill('evenodd');
+    ctx.strokeStyle = state ? this.c.accent : this.c.gridMajor;
+    ctx.lineWidth = state === 'selected' ? 2 : 1;
+    ctx.stroke();
+  }
+
+  /** Stairs: outline, tread lines and an arrow pointing up the flight. state: null | 'hover' | 'selected' | 'ghost'. */
+  drawStairs(st, state, { label = true } = {}) {
+    const m = this.model;
+    const { steps } = m.stairsInfo(st);
+    const u = m.stairsDir(st), n = perp(u);
+    const edge = state ? this.c.accent : this.c.wallEdge;
+    const fill = state === 'ghost' ? this.c.accentSoft : this.c.bg;
+    this.poly(m.stairsFootprint(st).map((q) => this.w2s(q)), fill, edge, state === 'selected' ? 2 : 1);
+    const going = st.length / steps, h = st.width / 2;
+    if (going * this.scale >= 2) {
+      for (let i = 1; i < steps; i++) {
+        const c = add(st, scale(u, going * i));
+        this.line(this.w2s(add(c, scale(n, h))), this.w2s(add(c, scale(n, -h))), edge, 0.75);
+      }
+    }
+    // Arrow up the centre line, from the bottom step to the top.
+    const a = this.w2s(add(st, scale(u, Math.min(going / 2, st.length / 4))));
+    const b = this.w2s(add(st, scale(u, st.length - Math.min(going / 2, st.length / 4))));
+    this.line(a, b, edge, 1.5);
+    const ang = angleOf(sub(b, a)), head = 8;
+    for (const k of [-1, 1]) {
+      const q = { x: b.x - Math.cos(ang + k * 0.45) * head, y: b.y - Math.sin(ang + k * 0.45) * head };
+      this.line(b, q, edge, 1.5);
+    }
+    if (label && state !== 'ghost') this.pill('UP', a.x, a.y, state === 'selected', angleOf(u));
+  }
+
+  drawFloorPreview() {
+    const fd = this.floorDraw;
+    const p = this.cursor ? this.floorPoint(this.cursor) : null;
+    const ctx = this.ctx;
+    if (fd) {
+      const pts = (p && !p.close ? [...fd.points, p] : fd.points).map((q) => this.w2s(q));
+      if (pts.length >= 3) this.poly(pts, this.c.accentSoft, null);
+      ctx.beginPath();
+      pts.forEach((q, i) => (i ? ctx.lineTo(q.x, q.y) : ctx.moveTo(q.x, q.y)));
+      if (p?.close) ctx.closePath();
+      ctx.strokeStyle = this.c.accent;
+      ctx.lineWidth = 1.5;
+      ctx.stroke();
+      fd.points.forEach((q, i) => {
+        const s = this.w2s(q);
+        ctx.beginPath();
+        ctx.arc(s.x, s.y, i === 0 && p?.close ? 7 : 3, 0, Math.PI * 2);
+        ctx.fillStyle = i === 0 && p?.close ? this.c.accent : '#ffffff';
+        ctx.fill();
+        ctx.lineWidth = 1.5;
+        ctx.stroke();
+      });
+      if (pts.length >= 3) {
+        const area = Math.abs(polygonArea(p && !p.close ? [...fd.points, p] : fd.points));
+        const c = pts.reduce((acc, q) => ({ x: acc.x + q.x / pts.length, y: acc.y + q.y / pts.length }), { x: 0, y: 0 });
+        this.pill(`${round(area / 10000, 2)} m²`, c.x, c.y, true);
+      }
+    }
+    if (p && !p.close) {
+      const sp = this.w2s(p);
+      ctx.beginPath();
+      ctx.arc(sp.x, sp.y, p.node ? 7 : 4, 0, Math.PI * 2);
+      ctx.strokeStyle = this.c.accent;
+      ctx.lineWidth = 2;
+      ctx.stroke();
+    }
   }
 
   drawGrid() {
@@ -925,7 +1209,7 @@ export class Editor2D {
   drawWallPreview() {
     if (!this.cursor) return;
     let p = this.snapDraw(this.cursor);
-    if (this.chain && this.keys.shift && !p.node) p = this.constrain(p);
+    if (this.chain && this.keys.shift && !p.node) p = this.constrain(p, this.chain.last);
     const ctx = this.ctx;
     const sp = this.w2s(p);
     if (this.chain) {

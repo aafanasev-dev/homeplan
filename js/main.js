@@ -10,6 +10,7 @@ const VIEW_KEY = 'homeplan.view';
 
 const $ = (sel) => document.querySelector(sel);
 const $$ = (sel) => [...document.querySelectorAll(sel)];
+const esc = (v) => String(v).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
 
 function storageGet(key) {
   try { return localStorage.getItem(key); } catch { return null; }
@@ -64,6 +65,7 @@ let saveTimer = 0;
 model.on(() => {
   clearTimeout(saveTimer);
   saveTimer = setTimeout(() => storageSet(STORAGE_KEY, model.serialize()), 300);
+  syncLevel(); // the active level can change through undo, import, "New" or deleting a level
   renderProps();
 });
 window.addEventListener('beforeunload', () => storageSet(STORAGE_KEY, model.serialize()));
@@ -105,6 +107,71 @@ function fitAll() {
   view3d?.fit();
 }
 
+// ------------------------------------------------------------------ levels
+
+let shownLevel = model.activeLevel; // the level the editor and 3D view were last told about
+let levelListKey = '';
+
+/** Rebuild the level select (top level first) when the list changed, and show the active level. */
+function renderLevels() {
+  const select = $('#level-select');
+  const key = model.levels.map((l) => `${l.id}:${l.name}`).join('|');
+  if (key !== levelListKey) {
+    levelListKey = key;
+    select.innerHTML = [...model.levels].reverse()
+      .map((l) => `<option value="${esc(l.id)}">${esc(l.name)}</option>`).join('');
+  }
+  select.value = model.activeLevel;
+}
+
+/** Tell the editor and the 3D view when the active level changed, and refresh the select. */
+function syncLevel() {
+  if (model.activeLevel !== shownLevel) {
+    shownLevel = model.activeLevel;
+    editor.onLevelChange();
+    view3d?.setActiveLevel(shownLevel);
+    renderProps(true);
+  }
+  renderLevels();
+}
+
+function switchLevel(id) {
+  if (editor.isBusy()) { renderLevels(); return; }
+  model.setActiveLevel(id);
+  syncLevel();
+}
+
+/** step: +1 for the level above, -1 for the level below. */
+function stepLevel(step) {
+  const next = model.levels[model.levelIndex(model.activeLevel) + step];
+  if (next) switchLevel(next.id);
+}
+
+function addLevel() {
+  if (editor.isBusy()) return;
+  const l = model.addLevel();
+  switchLevel(l.id);
+  history.commit();
+  updateHistoryButtons();
+}
+
+function deleteLevel() {
+  const l = model.getLevel(model.activeLevel);
+  if (!l || model.levels.length <= 1) return;
+  if (!confirm(`Delete "${l.name}" and everything on it? You can undo this.`)) return;
+  model.deleteLevel(l.id);
+  editor.setSelection(null);
+  history.commit();
+  updateHistoryButtons();
+}
+
+$('#level-select').addEventListener('change', (e) => {
+  switchLevel(e.target.value);
+  e.target.blur(); // so PageUp / PageDown and tool keys work again
+});
+
+renderLevels();
+
 // ------------------------------------------------------------------ import / export
 
 function exportJSON() {
@@ -144,6 +211,7 @@ document.querySelector('.toolbar').addEventListener('click', (e) => {
     case 'undo': undo(); break;
     case 'redo': redo(); break;
     case 'fit': fitAll(); break;
+    case 'add-level': addLevel(); break;
     case 'export': exportJSON(); break;
     case 'import': $('#import-file').click(); break;
     case 'new':
@@ -186,6 +254,9 @@ window.addEventListener('keydown', (e) => {
   if (mod || e.altKey) return;
   if (e.key === 'Delete' || e.key === 'Backspace') { e.preventDefault(); editor.deleteSelection(); return; }
   if (e.key === 'Escape') { editor.cancel(); return; }
+  if (e.key === 'Enter' && editor.finishFloor()) { e.preventDefault(); return; }
+  if (e.key === 'PageUp') { e.preventDefault(); stepLevel(1); return; }
+  if (e.key === 'PageDown') { e.preventDefault(); stepLevel(-1); return; }
   if (key === 'f') { fitAll(); return; }
   for (const [name, t] of Object.entries(TOOLS)) {
     if (t.key === key) { editor.setTool(name); return; }
@@ -214,16 +285,28 @@ function renderProps(force = false) {
   let html = '';
 
   if (!ent) {
-    const total = model.walls.reduce((s, w) => s + model.wallLength(w), 0);
+    const level = model.getLevel(model.activeLevel);
+    const L = level.id;
+    const walls = model.walls.filter((w) => w.level === L);
+    const wallIds = new Set(walls.map((w) => w.id));
+    const total = walls.reduce((s, w) => s + model.wallLength(w), 0);
     html = `<h2>Plan</h2>
-      ${readout('Walls', model.walls.length)}
-      ${readout('Openings', model.openings.length)}
+      ${field('Level name', `<input type="text" name="level-name" value="${esc(level.name)}" maxlength="40">`)}
+      ${field('Level height (cm)', numInput('level-height', level.height, { min: 10, max: 2000, step: 10 }))}
+      ${readout('Elevation', fmt(model.levelElevation(L)))}
+      ${readout('Walls', walls.length)}
+      ${readout('Openings', model.openings.filter((o) => wallIds.has(o.wallId)).length)}
+      ${readout('Floors', model.floors.filter((f) => f.level === L).length)}
+      ${readout('Stairs', model.stairs.filter((st) => st.level === L).length)}
       ${readout('Total wall length', `${round(total / 100, 2)} m`)}
-      <p class="hint">Select a wall, corner, door or window to edit it. Placement snaps to a 10 cm grid; hold Alt to place freely.</p>
+      ${model.levels.length > 1 ? '<div class="actions"><button type="button" class="danger" data-prop-action="delete-level">Delete level</button></div>' : ''}
+      <p class="hint">Counts are for this level. Select a wall, corner, door, window, floor or stairs to edit it. Placement snaps to a 10 cm grid; hold Alt to place freely.</p>
       <ul class="keys">
         <li>Select <kbd>V</kbd></li><li>Wall <kbd>W</kbd></li><li>Split <kbd>S</kbd></li>
+        <li>Floor <kbd>G</kbd></li><li>Close floor <kbd>Enter</kbd></li><li>Stairs <kbd>T</kbd></li>
         <li>Door <kbd>D</kbd></li><li>Window <kbd>1</kbd></li><li>Tall window <kbd>2</kbd></li>
         <li>Full-height window <kbd>3</kbd></li><li>Delete <kbd>Del</kbd></li>
+        <li>Level up / down <kbd>PgUp / PgDn</kbd></li>
         <li>Undo / redo <kbd>Ctrl+Z / Ctrl+Y</kbd></li><li>Pan <kbd>Space+drag</kbd></li><li>Fit <kbd>F</kbd></li>
       </ul>`;
   } else if (sel.kind === 'wall') {
@@ -265,6 +348,33 @@ function renderProps(force = false) {
       ${readout('Connected walls', model.wallsAtNode(n.id).length)}
       <div class="actions"><button type="button" class="danger" data-prop-action="delete">Delete corner</button></div>
       <p class="hint">Drag the corner to reshape every attached wall. Drop it on another corner to join them.</p>`;
+  } else if (sel.kind === 'floor') {
+    const f = ent;
+    html = `<h2>Floor</h2>
+      ${field('Thickness (cm)', numInput('thickness', f.thickness, { min: 1, max: 200, step: 1 }))}
+      ${readout('Area', `${round(model.floorArea(f) / 10000, 2)} m²`)}
+      ${readout('Corners', f.points.length)}
+      ${readout('Stairwells', model.floorHoles(f).length)}
+      <div class="actions"><button type="button" class="danger" data-prop-action="delete">Delete</button></div>
+      <p class="hint">Drag the floor to move it, or drag a square handle to move a corner. Stairs on the level below cut a stairwell when they fit inside it.</p>`;
+  } else if (sel.kind === 'stairs') {
+    const st = ent;
+    const info = model.stairsInfo(st);
+    const angles = [[0, 'Right (0°)'], [90, 'Down (90°)'], [180, 'Left (180°)'], [270, 'Up (270°)']]
+      .map(([a, label]) => `<option value="${a}"${a === st.angle ? ' selected' : ''}>${label}</option>`).join('');
+    html = `<h2>Stairs</h2>
+      ${field('Width (cm)', numInput('width', st.width, { min: 30, max: 1000, step: 10 }))}
+      ${field('Length (cm)', numInput('length', st.length, { min: 50, max: 2000, step: 10 }))}
+      ${field('Climbs towards', `<select name="angle">${angles}</select>`)}
+      ${readout('Rise', fmt(info.rise))}
+      ${readout('Steps', info.steps)}
+      ${readout('Step height', fmt(info.riser))}
+      ${readout('Step depth', fmt(info.going))}
+      <div class="actions">
+        <button type="button" data-prop-action="rotate">Rotate 90°</button>
+        <button type="button" class="danger" data-prop-action="delete">Delete</button>
+      </div>
+      <p class="hint">The flight climbs to the level above and cuts a stairwell in a floor there that contains it.</p>`;
   }
   body.innerHTML = html;
 }
@@ -272,10 +382,21 @@ function renderProps(force = false) {
 $('#props-body').addEventListener('change', (e) => {
   const el = e.target;
   const sel = editor.selection;
-  if (!sel || !el.name) return;
+  if (!el.name) return;
+  if (el.name === 'level-name' || el.name === 'level-height') {
+    if (el.name === 'level-name') model.updateLevel(model.activeLevel, { name: el.value });
+    else model.updateLevel(model.activeLevel, { height: parseFloat(el.value) });
+    history.commit();
+    updateHistoryButtons();
+    renderProps(true);
+    return;
+  }
+  if (!sel) return;
   const v = el.tagName === 'SELECT' ? el.value : parseFloat(el.value);
   if (el.tagName !== 'SELECT' && !Number.isFinite(v)) { renderProps(true); return; }
   if (sel.kind === 'wall') model.updateWall(sel.id, { [el.name]: v });
+  else if (sel.kind === 'floor') model.updateFloor(sel.id, { [el.name]: v });
+  else if (sel.kind === 'stairs') model.updateStairs(sel.id, { [el.name]: v });
   else if (sel.kind === 'opening') model.updateOpening(sel.id, { [el.name]: v });
   else if (sel.kind === 'node') {
     const n = model.getNode(sel.id);
@@ -291,10 +412,12 @@ $('#props-body').addEventListener('change', (e) => {
 $('#props-body').addEventListener('click', (e) => {
   const b = e.target.closest('[data-prop-action]');
   if (!b) return;
+  if (b.dataset.propAction === 'delete-level') { deleteLevel(); renderProps(true); return; }
   const sel = editor.selection;
   if (!sel) return;
   switch (b.dataset.propAction) {
     case 'delete': editor.deleteSelection(); break;
+    case 'rotate': editor.rotateStairs(sel.id); break;
     case 'split': editor.splitSelectedInHalf(); break;
     case 'flip-hinge': editor.flipDoor(sel.id, 1); break;
     case 'flip-side': editor.flipDoor(sel.id, 2); break;

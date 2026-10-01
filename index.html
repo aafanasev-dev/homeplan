@@ -22,6 +22,13 @@
       <button type="button" data-tool="select" title="Select and move (V)">Select <kbd>V</kbd></button>
       <button type="button" data-tool="wall" title="Draw walls (W)">Wall <kbd>W</kbd></button>
       <button type="button" data-tool="split" title="Split a wall (S)">Split <kbd>S</kbd></button>
+      <button type="button" data-tool="floor" title="Draw a floor by clicking its corners (G)">Floor <kbd>G</kbd></button>
+      <button type="button" data-tool="stairs" title="Place stairs to the level above (T)">Stairs <kbd>T</kbd></button>
+    </div>
+
+    <div class="group" aria-label="Level">
+      <select id="level-select" title="Level being edited (PageUp / PageDown)" aria-label="Level"></select>
+      <button type="button" data-action="add-level" title="Add an empty level on top">+ Level</button>
     </div>
 
     <div class="group" aria-label="Openings">

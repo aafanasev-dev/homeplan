@@ -1,19 +1,51 @@
 // Plan data model and geometry operations. No DOM: runs in the browser and under node.
 // Units are centimetres. Plan coordinates: x to the right, y downwards (screen-like).
 //
-//   nodes:    { id, x, y }
-//   walls:    { id, a: nodeId, b: nodeId, thickness, height }
+//
+//   levels:   { id, name, height }  ordered bottom to top; elevations are computed (levelElevation)
+//   nodes:    { id, x, y, level }
+//   walls:    { id, a: nodeId, b: nodeId, thickness, height, level }  both nodes are on `level`
 //   openings: { id, wallId, type, t /* centre offset along wall, cm from node a */, width, swing? }
+//             openings take their level from their wall
+//   floors:   { id, level, points: [{x,y}], thickness }  slab spans elevation - thickness .. elevation
+//   stairs:   { id, level, x, y, width, length, angle }  (x, y) is the start of the flight's centre
+//             line; it runs `length` cm in direction `angle` (degrees, 0/90/180/270) up to the next level
+//
+// activeLevel is UI state: the level that editing queries default to. It is not part of toJSON(),
+// so undo snapshots never record level switches.
 
 import {
-  sub, add, scale, dist, perp, normalize, projectOnSegment, lineIntersect, angleOf, snap, clamp, EPS,
+  sub, add, scale, dist, perp, normalize, projectOnSegment, lineIntersect, angleOf, snap, clamp,
+  polygonArea, pointInPolygon, distToSegment, EPS,
 } from './geometry.js';
-import { WALL_DEFAULTS, MIN_OPENING_WIDTH, OPENING_TYPES, isOpeningType } from './catalog.js';
+import {
+  WALL_DEFAULTS, FLOOR_DEFAULTS, STAIR_DEFAULTS, MIN_OPENING_WIDTH, OPENING_TYPES, isOpeningType,
+} from './catalog.js';
 
 export const NODE_SNAP_RADIUS = 10; // cm
 export const MIN_SPLIT_SEGMENT = 1; // cm, the shortest piece splitWall will create
 
 const num = (v, fallback) => (typeof v === 'number' && Number.isFinite(v) ? v : fallback);
+/** Snap an angle in degrees to 0, 90, 180 or 270. */
+const quarterTurn = (deg) => ((Math.round(num(+deg, 0) / 90) * 90) % 360 + 360) % 360;
+const levelName = (i) => `Level ${i + 1}`;
+
+/**
+ * Copy of a floor outline with finite { x, y } points and no repeated consecutive points.
+ * Returns null unless at least 3 points and a non-zero area remain.
+ */
+function cleanPolygon(points) {
+  const out = [];
+  for (const p of points) {
+    const x = num(p?.x, NaN), y = num(p?.y, NaN);
+    if (!Number.isFinite(x) || !Number.isFinite(y)) continue;
+    if (out.length && dist(out[out.length - 1], { x, y }) < EPS) continue;
+    out.push({ x, y });
+  }
+  while (out.length > 1 && dist(out[0], out[out.length - 1]) < EPS) out.pop();
+  if (out.length < 3 || Math.abs(polygonArea(out)) < 1) return null;
+  return out;
+}
 
 export class Model {
   constructor(data) {
@@ -21,14 +53,19 @@ export class Model {
     this._batch = 0;
     this._pending = false;
     this.reset();
-    if (data) this.load(data, { emit: false });
+    if (data) { this.activeLevel = null; this.load(data, { emit: false }); }
   }
 
+  /** Empty plan with a single level. */
   reset() {
+    this.nextId = 1;
+    this.levels = [{ id: this.newId('l'), name: levelName(0), height: WALL_DEFAULTS.height }];
+    this.activeLevel = this.levels[0].id;
     this.nodes = [];
     this.walls = [];
     this.openings = [];
-    this.nextId = 1;
+    this.floors = [];
+    this.stairs = [];
   }
 
   clear() {
@@ -66,11 +103,14 @@ export class Model {
 
   toJSON() {
     return {
-      version: 1,
+      version: 2,
       nextId: this.nextId,
+      levels: this.levels.map((l) => ({ ...l })),
       nodes: this.nodes.map((n) => ({ ...n })),
       walls: this.walls.map((w) => ({ ...w })),
       openings: this.openings.map((o) => ({ ...o })),
+      floors: this.floors.map((f) => ({ ...f, points: f.points.map((p) => ({ x: p.x, y: p.y })) })),
+      stairs: this.stairs.map((st) => ({ ...st })),
     };
   }
 
@@ -78,35 +118,67 @@ export class Model {
     return JSON.stringify(this.toJSON());
   }
 
-  /** Replace the model with `data` (object or JSON string). Invalid entries are dropped. */
+  /**
+   * Replace the model with `data` (object or JSON string). Invalid entries are dropped.
+   * Version 1 data (no levels) is migrated: everything goes onto a single default level.
+   * Entities without a level go onto the first level; entities on an unknown level are dropped.
+   */
   load(data, { emit = true } = {}) {
     const d = typeof data === 'string' ? JSON.parse(data) : data;
     if (!d || typeof d !== 'object') throw new Error('Plan data must be an object');
+    const list = (v) => (Array.isArray(v) ? v : []);
+    const levels = [];
     const nodes = [];
     const walls = [];
     const openings = [];
+    const floors = [];
+    const stairs = [];
     const ids = new Set();
-    for (const n of Array.isArray(d.nodes) ? d.nodes : []) {
+    for (const l of list(d.levels)) {
+      if (!l || l.id == null || ids.has(String(l.id))) continue;
+      ids.add(String(l.id));
+      const name = typeof l.name === 'string' && l.name.trim() ? l.name.trim() : levelName(levels.length);
+      levels.push({ id: String(l.id), name, height: clamp(num(l.height, WALL_DEFAULTS.height), 10, 2000) });
+    }
+    if (!levels.length) {
+      // v1 data: one default level, with an id that no other entity uses.
+      const taken = new Set();
+      for (const key of ['nodes', 'walls', 'openings', 'floors', 'stairs']) {
+        for (const e of list(d[key])) if (e && e.id != null) taken.add(String(e.id));
+      }
+      let k = 1;
+      while (taken.has(`l${k}`)) k++;
+      ids.add(`l${k}`);
+      levels.push({ id: `l${k}`, name: levelName(0), height: WALL_DEFAULTS.height });
+    }
+    const levelIds = new Set(levels.map((l) => l.id));
+    // Missing level -> first level (migration); a level that does not exist -> null (dropped).
+    const levelOf = (e) => (e.level == null ? levels[0].id : levelIds.has(String(e.level)) ? String(e.level) : null);
+
+    for (const n of list(d.nodes)) {
       if (!n || n.id == null || ids.has(String(n.id))) continue;
       const x = num(n.x, NaN), y = num(n.y, NaN);
-      if (!Number.isFinite(x) || !Number.isFinite(y)) continue;
+      const level = levelOf(n);
+      if (!Number.isFinite(x) || !Number.isFinite(y) || !level) continue;
       ids.add(String(n.id));
-      nodes.push({ id: String(n.id), x, y });
+      nodes.push({ id: String(n.id), x, y, level });
     }
-    const nodeIds = new Set(nodes.map((n) => n.id));
-    for (const w of Array.isArray(d.walls) ? d.walls : []) {
+    const nodeById = new Map(nodes.map((n) => [n.id, n]));
+    for (const w of list(d.walls)) {
       if (!w || w.id == null || ids.has(String(w.id))) continue;
       const a = String(w.a), b = String(w.b);
-      if (!nodeIds.has(a) || !nodeIds.has(b) || a === b) continue;
+      const na = nodeById.get(a), nb = nodeById.get(b);
+      if (!na || !nb || a === b || na.level !== nb.level) continue;
       ids.add(String(w.id));
       walls.push({
         id: String(w.id), a, b,
         thickness: clamp(num(w.thickness, WALL_DEFAULTS.thickness), 1, 200),
         height: clamp(num(w.height, WALL_DEFAULTS.height), 10, 2000),
+        level: na.level,
       });
     }
     const wallIds = new Set(walls.map((w) => w.id));
-    for (const o of Array.isArray(d.openings) ? d.openings : []) {
+    for (const o of list(d.openings)) {
       if (!o || o.id == null || ids.has(String(o.id))) continue;
       if (!wallIds.has(String(o.wallId)) || !isOpeningType(o.type)) continue;
       ids.add(String(o.id));
@@ -118,15 +190,43 @@ export class Model {
       if (o.swing != null) op.swing = (num(o.swing, 0) | 0) & 3;
       openings.push(op);
     }
+    for (const f of list(d.floors)) {
+      if (!f || f.id == null || ids.has(String(f.id))) continue;
+      const level = levelOf(f);
+      const points = cleanPolygon(list(f.points));
+      if (!level || !points) continue;
+      ids.add(String(f.id));
+      floors.push({
+        id: String(f.id), level, points,
+        thickness: clamp(num(f.thickness, FLOOR_DEFAULTS.thickness), 1, 200),
+      });
+    }
+    for (const st of list(d.stairs)) {
+      if (!st || st.id == null || ids.has(String(st.id))) continue;
+      const x = num(st.x, NaN), y = num(st.y, NaN);
+      const level = levelOf(st);
+      if (!Number.isFinite(x) || !Number.isFinite(y) || !level) continue;
+      ids.add(String(st.id));
+      stairs.push({
+        id: String(st.id), level, x, y,
+        width: clamp(num(st.width, STAIR_DEFAULTS.width), 30, 1000),
+        length: clamp(num(st.length, STAIR_DEFAULTS.length), 50, 2000),
+        angle: quarterTurn(st.angle),
+      });
+    }
     let maxId = 0;
     for (const id of ids) {
       const m = /(\d+)$/.exec(id);
       if (m) maxId = Math.max(maxId, Number(m[1]));
     }
+    this.levels = levels;
     this.nodes = nodes;
     this.walls = walls;
     this.openings = openings;
+    this.floors = floors;
+    this.stairs = stairs;
     this.nextId = Math.max(num(d.nextId, 1), maxId + 1);
+    if (!levelIds.has(this.activeLevel)) this.activeLevel = levels[0].id;
     for (const w of this.walls) this.clampWallOpenings(w.id);
     if (emit) this.emit();
     return this;
@@ -137,12 +237,25 @@ export class Model {
   getNode(id) { return this.nodes.find((n) => n.id === id) || null; }
   getWall(id) { return this.walls.find((w) => w.id === id) || null; }
   getOpening(id) { return this.openings.find((o) => o.id === id) || null; }
+  getFloor(id) { return this.floors.find((f) => f.id === id) || null; }
+  getStairs(id) { return this.stairs.find((s) => s.id === id) || null; }
+  getLevel(id) { return this.levels.find((l) => l.id === id) || null; }
 
   getEntity(kind, id) {
     if (kind === 'node') return this.getNode(id);
     if (kind === 'wall') return this.getWall(id);
     if (kind === 'opening') return this.getOpening(id);
+    if (kind === 'floor') return this.getFloor(id);
+    if (kind === 'stairs') return this.getStairs(id);
     return null;
+  }
+
+  /** Level an entity belongs to (openings take it from their wall), or null. */
+  levelOfEntity(kind, id) {
+    const e = this.getEntity(kind, id);
+    if (!e) return null;
+    if (kind === 'opening') return this.getWall(e.wallId)?.level ?? null;
+    return e.level ?? null;
   }
 
   wallsAtNode(nodeId) { return this.walls.filter((w) => w.a === nodeId || w.b === nodeId); }
@@ -182,21 +295,25 @@ export class Model {
     return this.walls.find((w) => (w.a === n1 && w.b === n2) || (w.a === n2 && w.b === n1)) || null;
   }
 
-  /** Nearest node within radius of p (excluding excludeId), or null. */
-  nodeNear(p, radius = NODE_SNAP_RADIUS, excludeId = null) {
+  /** Nearest node on `level` (default: the active level) within radius of p, excluding excludeId. */
+  nodeNear(p, radius = NODE_SNAP_RADIUS, excludeId = null, level = this.activeLevel) {
     let best = null, bestD = radius + EPS;
     for (const n of this.nodes) {
-      if (n.id === excludeId) continue;
+      if (n.id === excludeId || n.level !== level) continue;
       const d = dist(n, p);
       if (d <= bestD) { best = n; bestD = d; }
     }
     return best;
   }
 
-  /** Nearest wall to p whose centre line is within maxDist. Returns { wall, proj } or null. */
-  nearestWall(p, maxDist = Infinity, exclude = null) {
+  /**
+   * Nearest wall on `level` (default: the active level) whose centre line is within maxDist of p.
+   * Returns { wall, proj } or null.
+   */
+  nearestWall(p, maxDist = Infinity, exclude = null, level = this.activeLevel) {
     let best = null;
     for (const w of this.walls) {
+      if (w.level !== level) continue;
       if (exclude && exclude.has && exclude.has(w.id)) continue;
       const proj = this.projectOnWall(w, p);
       if (proj.dist <= maxDist && (!best || proj.dist < best.proj.dist)) best = { wall: w, proj };
@@ -204,35 +321,112 @@ export class Model {
     return best;
   }
 
-  bounds() {
-    if (!this.nodes.length) return null;
+  /** Plan extent of `level` (nodes, floors and stairs), or of every level when level is omitted. */
+  bounds(level) {
+    const on = (e) => level == null || e.level === level;
+    const pts = this.nodes.filter(on);
+    for (const f of this.floors) if (on(f)) pts.push(...f.points);
+    for (const s of this.stairs) if (on(s)) pts.push(...this.stairsFootprint(s));
+    if (!pts.length) return null;
     let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
-    for (const n of this.nodes) {
+    for (const n of pts) {
       minX = Math.min(minX, n.x); minY = Math.min(minY, n.y);
       maxX = Math.max(maxX, n.x); maxY = Math.max(maxY, n.y);
     }
     let maxH = 0;
-    for (const w of this.walls) maxH = Math.max(maxH, w.height);
+    for (const w of this.walls) if (on(w)) maxH = Math.max(maxH, w.height);
     return { minX, minY, maxX, maxY, maxHeight: maxH || WALL_DEFAULTS.height };
+  }
+
+  // ---------------------------------------------------------------- levels
+
+  levelIndex(id) { return this.levels.findIndex((l) => l.id === id); }
+  levelAbove(id) { const i = this.levelIndex(id); return i < 0 ? null : this.levels[i + 1] || null; }
+  levelBelow(id) { const i = this.levelIndex(id); return i <= 0 ? null : this.levels[i - 1]; }
+
+  /** Height of the level's floor above the ground: the sum of the heights of the levels below. */
+  levelElevation(id) {
+    let e = 0;
+    for (const l of this.levels) {
+      if (l.id === id) return e;
+      e += l.height;
+    }
+    return 0;
+  }
+
+  /** Make `id` the level that editing queries default to. UI state: not saved, not in undo. */
+  setActiveLevel(id) {
+    if (!this.getLevel(id) || id === this.activeLevel) return false;
+    this.activeLevel = id;
+    this.emit();
+    return true;
+  }
+
+  /** Add an empty level on top. Returns it. */
+  addLevel() {
+    const names = new Set(this.levels.map((l) => l.name));
+    let i = this.levels.length;
+    while (names.has(levelName(i))) i++;
+    const l = { id: this.newId('l'), name: levelName(i), height: WALL_DEFAULTS.height };
+    this.levels.push(l);
+    this.emit();
+    return l;
+  }
+
+  /**
+   * Rename a level or change its height. Walls on the level that were exactly the old level height
+   * follow the new height, so they keep reaching the floor above.
+   */
+  updateLevel(id, props = {}) {
+    const l = this.getLevel(id);
+    if (!l) return false;
+    if (typeof props.name === 'string' && props.name.trim()) l.name = props.name.trim();
+    if (props.height != null && Number.isFinite(+props.height)) {
+      const h = clamp(+props.height, 10, 2000);
+      for (const w of this.walls) {
+        if (w.level === id && Math.abs(w.height - l.height) < EPS) { w.height = h; this.clampWallOpenings(w.id); }
+      }
+      l.height = h;
+    }
+    this.emit();
+    return true;
+  }
+
+  /** Delete a level and everything on it. The last remaining level cannot be deleted. */
+  deleteLevel(id) {
+    const i = this.levelIndex(id);
+    if (i < 0 || this.levels.length <= 1) return false;
+    const wallIds = new Set(this.walls.filter((w) => w.level === id).map((w) => w.id));
+    this.openings = this.openings.filter((o) => !wallIds.has(o.wallId));
+    this.walls = this.walls.filter((w) => w.level !== id);
+    this.nodes = this.nodes.filter((n) => n.level !== id);
+    this.floors = this.floors.filter((f) => f.level !== id);
+    this.stairs = this.stairs.filter((s) => s.level !== id);
+    this.levels.splice(i, 1);
+    if (this.activeLevel === id) this.activeLevel = (this.levels[i - 1] || this.levels[0]).id;
+    this.emit();
+    return true;
   }
 
   // ---------------------------------------------------------------- nodes & walls
 
-  addNode(x, y) {
-    const n = { id: this.newId('n'), x, y };
+  addNode(x, y, level = this.activeLevel) {
+    const n = { id: this.newId('n'), x, y, level };
     this.nodes.push(n);
     return n;
   }
 
   /**
    * Return an existing node within `radius` of p, or (with splitWalls) a new node made by
-   * splitting a wall that passes through p, or else a brand new node.
+   * splitting a wall that passes through p, or else a brand new node. Only nodes and walls on
+   * `level` (default: the active level) are considered.
    */
-  getOrCreateNode(p, radius = NODE_SNAP_RADIUS, { splitWalls = false } = {}) {
-    const near = this.nodeNear(p, radius);
+  getOrCreateNode(p, radius = NODE_SNAP_RADIUS, { splitWalls = false, level = this.activeLevel } = {}) {
+    const near = this.nodeNear(p, radius, null, level);
     if (near) return near;
     if (splitWalls) {
       for (const w of this.walls) {
+        if (w.level !== level) continue;
         const proj = this.projectOnWall(w, p);
         if (proj.dist <= Math.max(w.thickness / 2, radius) &&
             proj.along > MIN_SPLIT_SEGMENT && proj.along < proj.length - MIN_SPLIT_SEGMENT) {
@@ -241,12 +435,12 @@ export class Model {
         }
       }
     }
-    return this.addNode(p.x, p.y);
+    return this.addNode(p.x, p.y, level);
   }
 
   /**
-   * Add a wall from p1 to p2, reusing nodes within the snap radius.
-   * Returns the new (or already existing identical) wall, or null if it would have zero length.
+   * Add a wall from p1 to p2 on opts.level (default: the active level), reusing nodes within the
+   * snap radius. Returns the new (or already existing identical) wall, or null if it would have zero length.
    */
   addWall(p1, p2, opts = {}) {
     const radius = opts.snapRadius ?? NODE_SNAP_RADIUS;
@@ -261,6 +455,7 @@ export class Model {
         id: this.newId('w'), a: na.id, b: nb.id,
         thickness: opts.thickness ?? WALL_DEFAULTS.thickness,
         height: opts.height ?? WALL_DEFAULTS.height,
+        level: na.level,
       };
       this.walls.push(w);
       this.emit();
@@ -325,11 +520,11 @@ export class Model {
     return true;
   }
 
-  /** If another node lies within radius of node `id`, merge `id` into it. Returns the surviving id or null. */
+  /** If another node on the same level lies within radius of node `id`, merge `id` into it. Returns the surviving id or null. */
   mergeNodeIfNear(id, radius = NODE_SNAP_RADIUS) {
     const n = this.getNode(id);
     if (!n) return null;
-    const other = this.nodeNear(n, radius, id);
+    const other = this.nodeNear(n, radius, id, n.level);
     if (!other) return null;
     this.mergeNodes(id, other.id);
     return other.id;
@@ -354,9 +549,9 @@ export class Model {
     const L = this.wallLength(w);
     if (along < MIN_SPLIT_SEGMENT || along > L - MIN_SPLIT_SEGMENT) return null;
     const p = this.pointOnWall(w, along);
-    const node = this.addNode(p.x, p.y);
-    const w1 = { id: this.newId('w'), a: w.a, b: node.id, thickness: w.thickness, height: w.height };
-    const w2 = { id: this.newId('w'), a: node.id, b: w.b, thickness: w.thickness, height: w.height };
+    const node = this.addNode(p.x, p.y, w.level);
+    const w1 = { id: this.newId('w'), a: w.a, b: node.id, thickness: w.thickness, height: w.height, level: w.level };
+    const w2 = { id: this.newId('w'), a: node.id, b: w.b, thickness: w.thickness, height: w.height, level: w.level };
     const idx = this.walls.indexOf(w);
     this.walls.splice(idx, 1, w1, w2);
     for (const o of this.openingsOnWall(w.id)) {
@@ -394,10 +589,14 @@ export class Model {
     this.openings = this.openings.filter((o) => o.id !== id);
   }
 
-  /** Delete a node (with its walls), a wall (with its openings), or an opening. */
+  /** Delete a node (with its walls), a wall (with its openings), an opening, a floor or stairs. */
   deleteEntity(kind, id) {
     if (!this.getEntity(kind, id)) return false;
-    if (kind === 'opening') {
+    if (kind === 'floor') {
+      this.floors = this.floors.filter((f) => f.id !== id);
+    } else if (kind === 'stairs') {
+      this.stairs = this.stairs.filter((s) => s.id !== id);
+    } else if (kind === 'opening') {
       this._removeOpening(id);
     } else if (kind === 'wall') {
       this._removeWall(id);
@@ -550,6 +749,144 @@ export class Model {
     for (const w of this.walls) this.clampWallOpenings(w.id);
     this.emit();
   }
+
+  // ---------------------------------------------------------------- floors
+
+  /**
+   * Add a floor polygon on opts.level (default: the active level). Needs at least 3 distinct points
+   * and a non-zero area; returns the floor or null.
+   */
+  addFloor(points, opts = {}) {
+    const pts = cleanPolygon(Array.isArray(points) ? points : []);
+    const level = opts.level ?? this.activeLevel;
+    if (!pts || !this.getLevel(level)) return null;
+    const f = {
+      id: this.newId('f'), level, points: pts,
+      thickness: clamp(num(opts.thickness, FLOOR_DEFAULTS.thickness), 1, 200),
+    };
+    this.floors.push(f);
+    this.emit();
+    return f;
+  }
+
+  moveFloor(id, dx, dy) {
+    const f = this.getFloor(id);
+    if (!f) return false;
+    for (const p of f.points) { p.x += dx; p.y += dy; }
+    this.emit();
+    return true;
+  }
+
+  moveFloorVertex(id, i, x, y) {
+    const f = this.getFloor(id);
+    if (!f || !f.points[i] || !Number.isFinite(x) || !Number.isFinite(y)) return false;
+    f.points[i].x = x;
+    f.points[i].y = y;
+    this.emit();
+    return true;
+  }
+
+  updateFloor(id, props = {}) {
+    const f = this.getFloor(id);
+    if (!f) return false;
+    if (props.thickness != null && Number.isFinite(+props.thickness)) f.thickness = clamp(+props.thickness, 1, 200);
+    this.emit();
+    return true;
+  }
+
+  floorArea(f) {
+    f = typeof f === 'string' ? this.getFloor(f) : f;
+    return f ? Math.abs(polygonArea(f.points)) : 0;
+  }
+
+  /**
+   * Stairwell holes in a floor: the footprints of stairs on the level directly below that lie
+   * entirely inside the floor polygon (corners on its edge count as inside).
+   */
+  floorHoles(f) {
+    f = typeof f === 'string' ? this.getFloor(f) : f;
+    const below = f && this.levelBelow(f.level);
+    if (!below) return [];
+    const onEdge = (p) => f.points.some((a, i) => distToSegment(p, a, f.points[(i + 1) % f.points.length]) < 0.01);
+    const holes = [];
+    for (const s of this.stairs) {
+      if (s.level !== below.id) continue;
+      const fp = this.stairsFootprint(s);
+      if (fp.every((p) => onEdge(p) || pointInPolygon(p, f.points))) holes.push(fp);
+    }
+    return holes;
+  }
+
+  // ---------------------------------------------------------------- stairs
+
+  /** Add a straight flight starting at (x, y) on opts.level (default: the active level). */
+  addStairs(x, y, opts = {}) {
+    const level = opts.level ?? this.activeLevel;
+    if (!Number.isFinite(x) || !Number.isFinite(y) || !this.getLevel(level)) return null;
+    const s = {
+      id: this.newId('s'), level, x, y,
+      width: clamp(num(opts.width, STAIR_DEFAULTS.width), 30, 1000),
+      length: clamp(num(opts.length, STAIR_DEFAULTS.length), 50, 2000),
+      angle: quarterTurn(opts.angle ?? 0),
+    };
+    this.stairs.push(s);
+    this.emit();
+    return s;
+  }
+
+  moveStairs(id, dx, dy) {
+    const s = this.getStairs(id);
+    if (!s) return false;
+    s.x += dx; s.y += dy;
+    this.emit();
+    return true;
+  }
+
+  /** Change width, length or angle. A new angle turns the flight about its footprint centre. */
+  updateStairs(id, props = {}) {
+    const s = this.getStairs(id);
+    if (!s) return false;
+    if (props.width != null && Number.isFinite(+props.width)) s.width = clamp(+props.width, 30, 1000);
+    if (props.length != null && Number.isFinite(+props.length)) s.length = clamp(+props.length, 50, 2000);
+    if (props.angle != null && Number.isFinite(+props.angle)) {
+      const angle = quarterTurn(props.angle);
+      if (angle !== s.angle) {
+        const c = add(s, scale(this.stairsDir(s), s.length / 2));
+        s.angle = angle;
+        const start = sub(c, scale(this.stairsDir(s), s.length / 2));
+        s.x = start.x; s.y = start.y;
+      }
+    }
+    this.emit();
+    return true;
+  }
+
+  /** Unit direction the flight climbs in (plan coords). */
+  stairsDir(s) {
+    const r = (s.angle * Math.PI) / 180;
+    return { x: Math.round(Math.cos(r) * 1e9) / 1e9, y: Math.round(Math.sin(r) * 1e9) / 1e9 };
+  }
+
+  /** The 4 footprint corners: bottom-left, top-left, top-right, bottom-right (seen walking up). */
+  stairsFootprint(s) {
+    const u = this.stairsDir(s), n = perp(u);
+    const start = { x: s.x, y: s.y };
+    const end = add(start, scale(u, s.length));
+    const h = s.width / 2;
+    return [add(start, scale(n, h)), add(end, scale(n, h)), add(end, scale(n, -h)), add(start, scale(n, -h))];
+  }
+
+  /**
+   * Rise and step count. The flight climbs to the next level's elevation, or by the level's own
+   * height when there is no level above. Returns { rise, steps, riser, going }.
+   */
+  stairsInfo(s) {
+    const level = this.getLevel(s.level);
+    const above = this.levelAbove(s.level);
+    const rise = above ? this.levelElevation(above.id) - this.levelElevation(s.level) : (level?.height ?? WALL_DEFAULTS.height);
+    const steps = Math.max(1, Math.round(rise / STAIR_DEFAULTS.riser));
+    return { rise, steps, riser: rise / steps, going: s.length / steps };
+  }
 }
 
 // -------------------------------------------------------------------- mitred wall outlines
@@ -559,11 +896,14 @@ export class Model {
  * Returns Map wallId -> { aPlus, bPlus, bMinus, aMinus, u, n, length } where "plus" is the side
  * the wall normal n = perp(u) points to and u is the unit direction a -> b.
  * The polygon in order is [aPlus, bPlus, bMinus, aMinus].
+ * With `level`, only that level's walls are computed. Walls never join across levels, because
+ * nodes belong to a single level.
  */
-export function computeWallPolygons(model) {
+export function computeWallPolygons(model, level = null) {
   const out = new Map();
   const ends = new Map(); // nodeId -> [{ wall, dir (outward), half, atA }]
   for (const w of model.walls) {
+    if (level != null && w.level !== level) continue;
     const { a, b } = model.wallEnds(w);
     const u = normalize(sub(b, a));
     const n = perp(u);
@@ -651,11 +991,12 @@ export class History {
   }
 }
 
-/** A small sample room used when nothing is saved yet. */
+/** A small sample room (one level, with a floor) used when nothing is saved yet. */
 export function createSampleModel() {
   const m = new Model();
   m.batch(() => {
     const pts = [{ x: 0, y: 0 }, { x: 600, y: 0 }, { x: 600, y: 400 }, { x: 0, y: 400 }];
+    m.addFloor(pts);
     const walls = pts.map((p, i) => m.addWall(p, pts[(i + 1) % pts.length]));
     m.addOpening(walls[0].id, 'window', 300);
     m.addOpening(walls[1].id, 'window_full', 200);
