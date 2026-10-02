@@ -72,3 +72,141 @@ export function openingDims(type, wallHeight) {
   height = Math.max(0, Math.min(height, wallHeight - sill));
   return { sill, height, top: sill + height };
 }
+
+// -------------------------------------------------------------------- stairs
+
+/** Thickness of a floating tread and the post of a spiral flight, in cm. */
+export const TREAD = 5;
+export const SPIRAL_POST = 10;
+
+/**
+ * How a flight is built. `straight` and `open` run from (x, y) along `length`; a `spiral` turns
+ * `sweep` degrees about (x, y), where `width` is the outer diameter.
+ */
+export const STAIR_KINDS = {
+  straight: { label: 'Stairs',        solid: true },
+  open:     { label: 'Open stairs',   solid: false },
+  spiral:   { label: 'Spiral stairs', solid: false, spiral: true, width: 160, sweep: 270 },
+};
+
+export const isStairKind = (kind) => Object.prototype.hasOwnProperty.call(STAIR_KINDS, kind);
+export const stairKindSpec = (kind) => STAIR_KINDS[kind] || STAIR_KINDS.straight;
+
+// -------------------------------------------------------------------- furniture
+
+/**
+ * Schematic furniture, each piece a handful of boxes.
+ *
+ * A part is written in fractions of the item's bounding box, so a resized piece keeps its
+ * proportions: x and y are the part's centre relative to the item's centre (-0.5 … 0.5), z is its
+ * base above the item's base (0 … 1), and w, d, h are its size as a fraction of the item's
+ * width, depth and height. Local axes are +x right and +y front, so the **back is at y = -0.5** —
+ * that is the face the editor puts against a wall. `mat` names a material both renderers know:
+ * case, top, soft, white, glass or metal.
+ */
+const p = (x, y, z, w, d, h, mat = 'case') => ({ x, y, z, w, d, h, mat });
+
+export const FURNITURE_TYPES = {
+  closet: {
+    label: 'Closet', room: 'bedroom', width: 180, depth: 60, height: 220,
+    parts: [p(0, 0, 0, 1, 1, 1), p(-0.25, 0.46, 0.02, 0.48, 0.08, 0.96, 'top'), p(0.25, 0.46, 0.02, 0.48, 0.08, 0.96, 'top')],
+  },
+  bed: {
+    label: 'Bed', room: 'bedroom', width: 90, depth: 200, height: 50,
+    parts: [p(0, 0, 0, 1, 1, 0.5), p(0, 0.05, 0.5, 0.94, 0.9, 0.4, 'soft'), p(0, -0.35, 0.9, 0.7, 0.14, 0.1, 'soft')],
+  },
+  bed_double: {
+    label: 'Double bed', room: 'bedroom', width: 160, depth: 200, height: 50,
+    parts: [
+      p(0, 0, 0, 1, 1, 0.5), p(0, 0.05, 0.5, 0.94, 0.9, 0.4, 'soft'),
+      p(-0.25, -0.35, 0.9, 0.4, 0.14, 0.1, 'soft'), p(0.25, -0.35, 0.9, 0.4, 0.14, 0.1, 'soft'),
+    ],
+  },
+  bedside_table: {
+    label: 'Bedside table', room: 'bedroom', width: 45, depth: 40, height: 55,
+    parts: [p(0, 0, 0, 1, 1, 1), p(0, 0.45, 0.55, 0.9, 0.1, 0.35, 'top')],
+  },
+  table_dining: {
+    label: 'Dining table', room: 'living', width: 160, depth: 90, height: 75,
+    parts: [
+      p(0, 0, 0.9, 1, 1, 0.1, 'top'),
+      p(-0.44, -0.42, 0, 0.06, 0.08, 0.9), p(0.44, -0.42, 0, 0.06, 0.08, 0.9),
+      p(-0.44, 0.42, 0, 0.06, 0.08, 0.9), p(0.44, 0.42, 0, 0.06, 0.08, 0.9),
+    ],
+  },
+  table_coffee: {
+    label: 'Coffee table', room: 'living', width: 110, depth: 60, height: 45,
+    parts: [
+      p(0, 0, 0.85, 1, 1, 0.15, 'top'),
+      p(-0.44, -0.4, 0, 0.06, 0.1, 0.85), p(0.44, -0.4, 0, 0.06, 0.1, 0.85),
+      p(-0.44, 0.4, 0, 0.06, 0.1, 0.85), p(0.44, 0.4, 0, 0.06, 0.1, 0.85),
+    ],
+  },
+  chair: {
+    label: 'Chair', room: 'living', width: 45, depth: 45, height: 90,
+    parts: [
+      p(0, 0, 0.45, 1, 1, 0.08, 'soft'), p(0, -0.44, 0.53, 1, 0.12, 0.47),
+      p(-0.44, -0.44, 0, 0.08, 0.08, 0.45), p(0.44, -0.44, 0, 0.08, 0.08, 0.45),
+      p(-0.44, 0.44, 0, 0.08, 0.08, 0.45), p(0.44, 0.44, 0, 0.08, 0.08, 0.45),
+    ],
+  },
+  armchair: {
+    label: 'Armchair', room: 'living', width: 85, depth: 85, height: 80,
+    parts: [
+      p(0, 0.06, 0, 1, 0.88, 0.45, 'soft'), p(0, -0.4, 0, 1, 0.2, 1, 'soft'),
+      p(-0.44, 0.06, 0.45, 0.12, 0.88, 0.3, 'soft'), p(0.44, 0.06, 0.45, 0.12, 0.88, 0.3, 'soft'),
+      p(0, 0.08, 0.45, 0.74, 0.78, 0.12, 'top'),
+    ],
+  },
+  sofa: {
+    label: 'Sofa', room: 'living', width: 200, depth: 90, height: 80,
+    parts: [
+      p(0, 0.06, 0, 1, 0.88, 0.45, 'soft'), p(0, -0.4, 0, 1, 0.2, 1, 'soft'),
+      p(-0.46, 0.06, 0.45, 0.08, 0.88, 0.3, 'soft'), p(0.46, 0.06, 0.45, 0.08, 0.88, 0.3, 'soft'),
+      p(-0.21, 0.08, 0.45, 0.4, 0.78, 0.12, 'top'), p(0.21, 0.08, 0.45, 0.4, 0.78, 0.12, 'top'),
+    ],
+  },
+  fridge: {
+    label: 'Refrigerator', room: 'kitchen', width: 60, depth: 65, height: 180,
+    parts: [p(0, 0, 0, 1, 1, 1), p(0, 0.46, 0.35, 0.96, 0.08, 0.63, 'top'), p(0, 0.46, 0.02, 0.96, 0.08, 0.3, 'top')],
+  },
+  kitchen_base: {
+    label: 'Kitchen module', room: 'kitchen', width: 60, depth: 60, height: 85,
+    parts: [p(0, 0, 0, 1, 0.96, 0.92), p(0, 0, 0.92, 1, 1, 0.08, 'top')],
+  },
+  kitchen_wall: {
+    label: 'Wall cabinet', room: 'kitchen', width: 60, depth: 35, height: 70, mount: 'wall', elevation: 140,
+    parts: [p(0, 0, 0, 1, 1, 1), p(0, 0.45, 0.03, 0.96, 0.1, 0.94, 'top')],
+  },
+  bath: {
+    label: 'Bath', room: 'bath', width: 170, depth: 75, height: 55,
+    parts: [p(0, 0, 0, 1, 1, 0.9, 'white'), p(0, 0, 0.35, 0.86, 0.8, 0.65, 'top')],
+  },
+  shower: {
+    label: 'Shower cabin', room: 'bath', width: 90, depth: 90, height: 200,
+    parts: [
+      p(0, 0, 0, 1, 1, 0.06, 'white'),
+      p(-0.48, 0, 0.06, 0.04, 1, 0.94, 'glass'), p(0, -0.48, 0.06, 1, 0.04, 0.94, 'glass'),
+    ],
+  },
+  toilet: {
+    label: 'Toilet', room: 'bath', width: 38, depth: 65, height: 75,
+    parts: [p(0, -0.35, 0, 1, 0.3, 1, 'white'), p(0, 0.15, 0, 0.85, 0.7, 0.55, 'white'), p(0, 0.15, 0.55, 0.85, 0.7, 0.05, 'top')],
+  },
+  sink: {
+    label: 'Sink', room: 'bath', width: 60, depth: 45, height: 85,
+    parts: [p(0, 0, 0, 0.9, 0.9, 0.85), p(0, 0, 0.85, 1, 1, 0.15, 'white')],
+  },
+};
+
+export const isFurnitureType = (type) => Object.prototype.hasOwnProperty.call(FURNITURE_TYPES, type);
+export const furnitureSpec = (type) => FURNITURE_TYPES[type] || FURNITURE_TYPES.chair;
+
+/** The parts of an item of this size, in cm about its own centre and base: { x, y, z, w, d, h, mat }. */
+export function furnitureParts(type, { width, depth, height }) {
+  return furnitureSpec(type).parts.map((q) => ({
+    x: q.x * width, y: q.y * depth, z: q.z * height,
+    w: q.w * width, d: q.d * depth, h: q.h * height,
+    mat: q.mat,
+  }));
+}

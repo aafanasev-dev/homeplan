@@ -15,8 +15,13 @@
 //   floors:   { id, level, kind: 'slab' | 'cutout', points: [{x,y}], thickness }
 //             a slab spans elevation - thickness .. elevation; a cutout is a hole punched in the
 //             slabs of its own level (it is never built, in 2D or in 3D)
-//   stairs:   { id, level, x, y, width, length, angle }  (x, y) is the start of the flight's centre
-//             line; it runs `length` cm in direction `angle` (degrees, 0/90/180/270) up to the next level
+//   stairs:   { id, level, x, y, width, length, angle, kind?, sweep? }  a straight or open flight
+//             starts at (x, y) and runs `length` cm in direction `angle` (any angle, degrees) up to
+//             the next level; a spiral (kind 'spiral') turns `sweep` degrees about (x, y), which is
+//             its centre, with `width` as the outer diameter
+//   furniture:{ id, level, type, x, y, angle, width, depth, height, elevation }  a schematic piece
+//             from catalog.FURNITURE_TYPES, centred on (x, y) and turned by `angle`; its local +y
+//             (the front) points away from the wall it was snapped to
 //
 // activeLevel is UI state: the level that editing queries default to. It is not part of toJSON(),
 // so undo snapshots never record level switches.
@@ -28,15 +33,16 @@ import {
 } from './geometry.js';
 import {
   WALL_DEFAULTS, FLOOR_DEFAULTS, STAIR_DEFAULTS, MIN_OPENING_WIDTH, OPENING_TYPES, isOpeningType,
-  openingSpec, isWallStyle, wallSpec,
+  openingSpec, isWallStyle, wallSpec, isStairKind, stairKindSpec, STAIR_KINDS,
+  isFurnitureType, furnitureSpec,
 } from './catalog.js';
 
 export const NODE_SNAP_RADIUS = 10; // cm
 export const MIN_SPLIT_SEGMENT = 1; // cm, the shortest piece splitWall will create
 
 const num = (v, fallback) => (typeof v === 'number' && Number.isFinite(v) ? v : fallback);
-/** Snap an angle in degrees to 0, 90, 180 or 270. */
-const quarterTurn = (deg) => ((Math.round(num(+deg, 0) / 90) * 90) % 360 + 360) % 360;
+/** An angle in degrees, normalised into 0 … 359. */
+const normAngle = (deg) => ((num(+deg, 0) % 360) + 360) % 360;
 const levelName = (i) => `Level ${i + 1}`;
 
 /**
@@ -75,6 +81,7 @@ export class Model {
     this.openings = [];
     this.floors = [];
     this.stairs = [];
+    this.furniture = [];
   }
 
   clear() {
@@ -120,6 +127,7 @@ export class Model {
       openings: this.openings.map((o) => ({ ...o })),
       floors: this.floors.map((f) => ({ ...f, points: f.points.map((p) => ({ x: p.x, y: p.y })) })),
       stairs: this.stairs.map((st) => ({ ...st })),
+      furniture: this.furniture.map((f) => ({ ...f })),
     };
   }
 
@@ -142,6 +150,7 @@ export class Model {
     const openings = [];
     const floors = [];
     const stairs = [];
+    const furniture = [];
     const ids = new Set();
     for (const l of list(d.levels)) {
       if (!l || l.id == null || ids.has(String(l.id))) continue;
@@ -152,7 +161,7 @@ export class Model {
     if (!levels.length) {
       // v1 data: one default level, with an id that no other entity uses.
       const taken = new Set();
-      for (const key of ['nodes', 'walls', 'openings', 'floors', 'stairs']) {
+      for (const key of ['nodes', 'walls', 'openings', 'floors', 'stairs', 'furniture']) {
         for (const e of list(d[key])) if (e && e.id != null) taken.add(String(e.id));
       }
       let k = 1;
@@ -221,11 +230,30 @@ export class Model {
       const level = levelOf(st);
       if (!Number.isFinite(x) || !Number.isFinite(y) || !level) continue;
       ids.add(String(st.id));
-      stairs.push({
+      const flight = {
         id: String(st.id), level, x, y,
         width: clamp(num(st.width, STAIR_DEFAULTS.width), 30, 1000),
         length: clamp(num(st.length, STAIR_DEFAULTS.length), 50, 2000),
-        angle: quarterTurn(st.angle),
+        angle: normAngle(st.angle),
+      };
+      if (isStairKind(st.kind) && st.kind !== 'straight') flight.kind = st.kind;
+      if (stairKindSpec(flight.kind).spiral) flight.sweep = clamp(num(st.sweep, STAIR_KINDS.spiral.sweep), -720, 720);
+      stairs.push(flight);
+    }
+    for (const f of list(d.furniture)) {
+      if (!f || f.id == null || ids.has(String(f.id)) || !isFurnitureType(f.type)) continue;
+      const x = num(f.x, NaN), y = num(f.y, NaN);
+      const level = levelOf(f);
+      if (!Number.isFinite(x) || !Number.isFinite(y) || !level) continue;
+      ids.add(String(f.id));
+      const spec = furnitureSpec(f.type);
+      furniture.push({
+        id: String(f.id), level, type: f.type, x, y,
+        angle: normAngle(f.angle),
+        width: clamp(num(f.width, spec.width), 5, 1000),
+        depth: clamp(num(f.depth, spec.depth), 5, 1000),
+        height: clamp(num(f.height, spec.height), 5, 1000),
+        elevation: clamp(num(f.elevation, spec.elevation ?? 0), 0, 2000),
       });
     }
     let maxId = 0;
@@ -239,6 +267,7 @@ export class Model {
     this.openings = openings;
     this.floors = floors;
     this.stairs = stairs;
+    this.furniture = furniture;
     this.nextId = Math.max(num(d.nextId, 1), maxId + 1);
     if (!levelIds.has(this.activeLevel)) this.activeLevel = levels[0].id;
     for (const w of this.walls) this.clampWallOpenings(w.id);
@@ -253,6 +282,7 @@ export class Model {
   getOpening(id) { return this.openings.find((o) => o.id === id) || null; }
   getFloor(id) { return this.floors.find((f) => f.id === id) || null; }
   getStairs(id) { return this.stairs.find((s) => s.id === id) || null; }
+  getFurniture(id) { return this.furniture.find((f) => f.id === id) || null; }
   getLevel(id) { return this.levels.find((l) => l.id === id) || null; }
 
   getEntity(kind, id) {
@@ -261,6 +291,7 @@ export class Model {
     if (kind === 'opening') return this.getOpening(id);
     if (kind === 'floor') return this.getFloor(id);
     if (kind === 'stairs') return this.getStairs(id);
+    if (kind === 'furniture') return this.getFurniture(id);
     return null;
   }
 
@@ -364,6 +395,7 @@ export class Model {
     for (const w of this.walls) if (on(w) && w.bulge) pts.push(...this.wallSamples(w));
     for (const f of this.floors) if (on(f)) pts.push(...f.points);
     for (const s of this.stairs) if (on(s)) pts.push(...this.stairsFootprint(s));
+    for (const f of this.furniture) if (on(f)) pts.push(...this.furnitureFootprint(f));
     if (!pts.length) return null;
     let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
     for (const n of pts) {
@@ -439,6 +471,7 @@ export class Model {
     this.nodes = this.nodes.filter((n) => n.level !== id);
     this.floors = this.floors.filter((f) => f.level !== id);
     this.stairs = this.stairs.filter((s) => s.level !== id);
+    this.furniture = this.furniture.filter((f) => f.level !== id);
     this.levels.splice(i, 1);
     if (this.activeLevel === id) this.activeLevel = (this.levels[i - 1] || this.levels[0]).id;
     this.emit();
@@ -668,6 +701,8 @@ export class Model {
       this.floors = this.floors.filter((f) => f.id !== id);
     } else if (kind === 'stairs') {
       this.stairs = this.stairs.filter((s) => s.id !== id);
+    } else if (kind === 'furniture') {
+      this.furniture = this.furniture.filter((f) => f.id !== id);
     } else if (kind === 'opening') {
       this._removeOpening(id);
     } else if (kind === 'wall') {
@@ -1018,19 +1053,34 @@ export class Model {
 
   // ---------------------------------------------------------------- stairs
 
-  /** Add a straight flight starting at (x, y) on opts.level (default: the active level). */
+  /**
+   * Add a flight on opts.level (default: the active level). A straight or open flight starts at
+   * (x, y); a spiral one turns about it.
+   */
   addStairs(x, y, opts = {}) {
     const level = opts.level ?? this.activeLevel;
     if (!Number.isFinite(x) || !Number.isFinite(y) || !this.getLevel(level)) return null;
+    const kind = isStairKind(opts.kind) ? opts.kind : 'straight';
+    const spec = stairKindSpec(kind);
     const s = {
       id: this.newId('s'), level, x, y,
-      width: clamp(num(opts.width, STAIR_DEFAULTS.width), 30, 1000),
+      width: clamp(num(opts.width, spec.width ?? STAIR_DEFAULTS.width), 30, 1000),
       length: clamp(num(opts.length, STAIR_DEFAULTS.length), 50, 2000),
-      angle: quarterTurn(opts.angle ?? 0),
+      angle: normAngle(opts.angle ?? 0),
     };
+    if (kind !== 'straight') s.kind = kind;
+    if (spec.spiral) s.sweep = clamp(num(opts.sweep, spec.sweep), -720, 720);
     this.stairs.push(s);
     this.emit();
     return s;
+  }
+
+  /** True for a flight that winds about its own centre. */
+  isSpiral(s) { return !!stairKindSpec(s?.kind).spiral; }
+
+  /** The centre of a flight's footprint: the middle of the run, or the axis of a spiral. */
+  stairsCentre(s) {
+    return this.isSpiral(s) ? { x: s.x, y: s.y } : add(s, scale(this.stairsDir(s), s.length / 2));
   }
 
   moveStairs(id, dx, dy) {
@@ -1041,19 +1091,46 @@ export class Model {
     return true;
   }
 
-  /** Change width, length or angle. A new angle turns the flight about its footprint centre. */
+  /**
+   * Change kind, width, length, sweep or angle. Changing the kind leaves the flight where it is,
+   * and a new angle turns it about its footprint centre.
+   */
   updateStairs(id, props = {}) {
     const s = this.getStairs(id);
     if (!s) return false;
+    if (props.kind != null && isStairKind(props.kind) && props.kind !== (s.kind || 'straight')) {
+      const spec = stairKindSpec(props.kind);
+      const centre = this.stairsCentre(s);
+      const wasSpiral = this.isSpiral(s);
+      if (props.kind === 'straight') delete s.kind;
+      else s.kind = props.kind;
+      if (spec.spiral) {
+        if (props.width == null) s.width = clamp(spec.width, 30, 1000);
+        s.sweep = clamp(num(props.sweep ?? s.sweep, spec.sweep), -720, 720);
+        s.x = centre.x; s.y = centre.y;
+      } else if (wasSpiral) {
+        delete s.sweep;
+        if (props.width == null) s.width = STAIR_DEFAULTS.width;
+        const start = sub(centre, scale(this.stairsDir(s), s.length / 2));
+        s.x = start.x; s.y = start.y;
+      }
+    }
     if (props.width != null && Number.isFinite(+props.width)) s.width = clamp(+props.width, 30, 1000);
     if (props.length != null && Number.isFinite(+props.length)) s.length = clamp(+props.length, 50, 2000);
+    if (props.sweep != null && Number.isFinite(+props.sweep) && this.isSpiral(s)) {
+      s.sweep = clamp(+props.sweep, -720, 720);
+    }
     if (props.angle != null && Number.isFinite(+props.angle)) {
-      const angle = quarterTurn(props.angle);
+      const angle = normAngle(props.angle);
       if (angle !== s.angle) {
-        const c = add(s, scale(this.stairsDir(s), s.length / 2));
-        s.angle = angle;
-        const start = sub(c, scale(this.stairsDir(s), s.length / 2));
-        s.x = start.x; s.y = start.y;
+        if (this.isSpiral(s)) {
+          s.angle = angle; // a spiral already turns about its own centre
+        } else {
+          const c = add(s, scale(this.stairsDir(s), s.length / 2));
+          s.angle = angle;
+          const start = sub(c, scale(this.stairsDir(s), s.length / 2));
+          s.x = start.x; s.y = start.y;
+        }
       }
     }
     this.emit();
@@ -1066,8 +1143,20 @@ export class Model {
     return { x: Math.round(Math.cos(r) * 1e9) / 1e9, y: Math.round(Math.sin(r) * 1e9) / 1e9 };
   }
 
-  /** The 4 footprint corners: bottom-left, top-left, top-right, bottom-right (seen walking up). */
+  /**
+   * The footprint: 4 corners for a straight or open flight (bottom-left, top-left, top-right,
+   * bottom-right seen walking up), or a 16-gon around a spiral's outer diameter.
+   */
   stairsFootprint(s) {
+    if (this.isSpiral(s)) {
+      const r = s.width / 2;
+      const out = [];
+      for (let i = 0; i < 16; i++) {
+        const a = (i / 16) * Math.PI * 2;
+        out.push({ x: s.x + Math.cos(a) * r, y: s.y + Math.sin(a) * r });
+      }
+      return out;
+    }
     const u = this.stairsDir(s), n = perp(u);
     const start = { x: s.x, y: s.y };
     const end = add(start, scale(u, s.length));
@@ -1077,14 +1166,89 @@ export class Model {
 
   /**
    * Rise and step count. The flight climbs to the next level's elevation, or by the level's own
-   * height when there is no level above. Returns { rise, steps, riser, going }.
+   * height when there is no level above. Returns { rise, steps, riser, going, treadAngle }, where
+   * `going` is the tread depth (measured at the walking line of a spiral) and `treadAngle` is how
+   * far a spiral turns per step (0 for a straight flight).
    */
   stairsInfo(s) {
     const level = this.getLevel(s.level);
     const above = this.levelAbove(s.level);
     const rise = above ? this.levelElevation(above.id) - this.levelElevation(s.level) : (level?.height ?? WALL_DEFAULTS.height);
     const steps = Math.max(1, Math.round(rise / STAIR_DEFAULTS.riser));
-    return { rise, steps, riser: rise / steps, going: s.length / steps };
+    if (this.isSpiral(s)) {
+      const treadAngle = (s.sweep ?? STAIR_KINDS.spiral.sweep) / steps;
+      const going = Math.abs(((treadAngle * Math.PI) / 180) * (s.width / 2) * 0.7);
+      return { rise, steps, riser: rise / steps, going, treadAngle };
+    }
+    return { rise, steps, riser: rise / steps, going: s.length / steps, treadAngle: 0 };
+  }
+
+  // ---------------------------------------------------------------- furniture
+
+  /** Add a piece of furniture centred on (x, y) on opts.level (default: the active level). */
+  addFurniture(type, x, y, opts = {}) {
+    const level = opts.level ?? this.activeLevel;
+    if (!isFurnitureType(type) || !Number.isFinite(x) || !Number.isFinite(y) || !this.getLevel(level)) return null;
+    const spec = furnitureSpec(type);
+    const f = {
+      id: this.newId('u'), level, type, x, y,
+      angle: normAngle(opts.angle ?? 0),
+      width: clamp(num(opts.width, spec.width), 5, 1000),
+      depth: clamp(num(opts.depth, spec.depth), 5, 1000),
+      height: clamp(num(opts.height, spec.height), 5, 1000),
+      elevation: clamp(num(opts.elevation, spec.elevation ?? 0), 0, 2000),
+    };
+    this.furniture.push(f);
+    this.emit();
+    return f;
+  }
+
+  moveFurniture(id, dx, dy) {
+    const f = this.getFurniture(id);
+    if (!f) return false;
+    f.x += dx; f.y += dy;
+    this.emit();
+    return true;
+  }
+
+  /** Change type, size, elevation or angle. A new type brings its own size unless one is given. */
+  updateFurniture(id, props = {}) {
+    const f = this.getFurniture(id);
+    if (!f) return false;
+    if (props.type != null && isFurnitureType(props.type) && props.type !== f.type) {
+      const spec = furnitureSpec(props.type);
+      f.type = props.type;
+      if (props.width == null) f.width = spec.width;
+      if (props.depth == null) f.depth = spec.depth;
+      if (props.height == null) f.height = spec.height;
+      if (props.elevation == null) f.elevation = spec.elevation ?? 0;
+    }
+    for (const k of ['width', 'depth', 'height']) {
+      if (props[k] != null && Number.isFinite(+props[k])) f[k] = clamp(+props[k], 5, 1000);
+    }
+    if (props.elevation != null && Number.isFinite(+props.elevation)) f.elevation = clamp(+props.elevation, 0, 2000);
+    if (props.angle != null && Number.isFinite(+props.angle)) f.angle = normAngle(props.angle);
+    this.emit();
+    return true;
+  }
+
+  /** Unit direction of the item's local +x axis (its width runs along this). */
+  furnitureDir(f) {
+    const r = (f.angle * Math.PI) / 180;
+    return { x: Math.round(Math.cos(r) * 1e9) / 1e9, y: Math.round(Math.sin(r) * 1e9) / 1e9 };
+  }
+
+  /** The 4 footprint corners: back-left, back-right, front-right, front-left. */
+  furnitureFootprint(f) {
+    const u = this.furnitureDir(f), n = perp(u);
+    const c = { x: f.x, y: f.y };
+    const hw = f.width / 2, hd = f.depth / 2;
+    return [
+      add(add(c, scale(u, -hw)), scale(n, -hd)),
+      add(add(c, scale(u, hw)), scale(n, -hd)),
+      add(add(c, scale(u, hw)), scale(n, hd)),
+      add(add(c, scale(u, -hw)), scale(n, hd)),
+    ];
   }
 }
 

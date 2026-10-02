@@ -5,13 +5,18 @@ import {
   pointInPolygon, polygonArea, arcFromChord, arcPointAt, arcSamples, arcOffset, splineBulges,
 } from './geometry.js';
 import { computeWallPolygons } from './model.js';
-import { OPENING_TYPES, STAIR_DEFAULTS, openingSpec, wallSpec } from './catalog.js';
+import {
+  OPENING_TYPES, STAIR_DEFAULTS, openingSpec, wallSpec,
+  stairKindSpec, SPIRAL_POST, FURNITURE_TYPES, furnitureSpec, furnitureParts,
+} from './catalog.js';
 
 const OPENING_SNAP_DIST = 40; // cm: how close the cursor must be to a wall to place an opening
 const DRAG_THRESHOLD = 3;     // px before a press becomes a drag
 const MIN_SCALE = 0.03, MAX_SCALE = 12; // px per cm
 const CLOSE_DIST = 10;        // px: clicking this close to a floor's first point closes it
 const GHOST_ALPHA = 0.3;      // opacity of the level below
+const WALL_SNAP_DIST = 60;    // cm: a piece of furniture this close to a wall backs onto it
+const ROTATE_SNAP = 15;       // degrees the rotate handle snaps to
 
 export const TOOLS = {
   select:      { label: 'Select',             key: 'v', hint: 'Click to select, drag to move. Double-click a wall to split it. Drag empty space to pan.' },
@@ -24,7 +29,9 @@ export const TOOLS = {
   floor:       { label: 'Floor',              key: 'g', hint: 'Click to add corners. Click the first corner, double-click or press Enter to close; Esc cancels. Shift keeps edges straight.' },
   fill:        { label: 'Floor fill',         key: 'r', hint: 'Click inside a room closed by walls to fill it with a floor in one click.' },
   cutout:      { label: 'Floor cutout',       key: 'h', hint: 'Click to add corners of a hole in the floor. Double-click or press Enter to close; Esc cancels.' },
-  stairs:      { label: 'Stairs',             key: 't', hint: 'Click to place a flight climbing to the right; rotate it from its menu. It cuts a stairwell in the floor above.' },
+  stairs:         { label: 'Stairs',        key: 't', stairKind: 'straight', hint: 'Click to place a flight climbing to the right; drag its round handle to turn it. It cuts a stairwell in the floor above.' },
+  stairs_open:    { label: 'Open stairs',             stairKind: 'open',     hint: 'Click to place a flight of floating treads with nothing underneath.' },
+  stairs_spiral:  { label: 'Spiral stairs',           stairKind: 'spiral',   hint: 'Click to place a spiral flight; its width is the outer diameter and it turns 270 degrees by default.' },
   door:               { label: 'Door',                     key: 'd', opening: 'door' },
   door_double:        { label: 'Double door',                        opening: 'door_double' },
   door_slide:         { label: 'Sliding door',                       opening: 'door_slide' },
@@ -37,6 +44,15 @@ export const TOOLS = {
   window_double_tall: { label: 'Double tall window',       key: '6', opening: 'window_double_tall' },
   window_double_full: { label: 'Double full-height window', key: '7', opening: 'window_double_full' },
 };
+
+// One tool per furniture type, so the palette and the catalog can never drift apart.
+for (const [type, spec] of Object.entries(FURNITURE_TYPES)) {
+  TOOLS[`f_${type}`] = {
+    label: spec.label,
+    furniture: type,
+    hint: `Click to place a ${spec.label.toLowerCase()}. Near a wall it turns and backs onto it; hold Alt to place it freely.`,
+  };
+}
 
 const fmtM = (cm) => `${round(cm / 100, 2).toFixed(2)} m`;
 
@@ -67,7 +83,8 @@ export class Editor2D {
     this.chain = null;     // wall tool: { last: {x,y}, start: {x,y}, count }
     this.floorDraw = null; // floor / cutout tool: { points: [{x,y}], kind }
     this.fillPreview = null; // floor fill tool: the room outline under the cursor
-    this.stairGhost = null; // stairs tool preview: { x, y }
+    this.stairGhost = null; // stairs tool preview: { x, y, kind }
+    this.furnitureGhost = null; // furniture tool preview: { x, y, angle, type }
     this.ghost = null;     // opening tool preview
     this.splitPreview = null;
     this.cursor = null;    // world position of the mouse
@@ -106,6 +123,7 @@ export class Editor2D {
       text: v('--plan-text', '#1f2329'),
       pill: v('--plan-pill', 'rgba(255,255,255,0.9)'),
       floor: v('--plan-floor', '#efe9dd'),
+      furniture: v('--plan-furniture', '#e3dccd'),
       barrier: v('--plan-barrier', '#767d89'),
     };
   }
@@ -170,6 +188,7 @@ export class Editor2D {
     this.ghost = null;
     this.splitPreview = null;
     this.stairGhost = null;
+    this.furnitureGhost = null;
     this.fillPreview = null;
     this.hideMenu();
     this.updateCursorStyle();
@@ -238,6 +257,44 @@ export class Editor2D {
     return this.keys.alt ? { x: p.x, y: p.y } : snapPoint(p, GRID);
   }
 
+  /**
+   * Where a piece of furniture lands for a cursor at p: backed onto a nearby wall and turned to it,
+   * or snapped to the grid. Alt places it freely. `size` defaults to the type's catalog size.
+   */
+  furnitureSpot(type, p, size = null) {
+    const depth = size?.depth ?? furnitureSpec(type).depth;
+    if (!this.keys.alt) {
+      const hit = this.model.nearestWall(p, WALL_SNAP_DIST);
+      if (hit && hit.proj.rawT > -0.001 && hit.proj.rawT < 1.001) {
+        const u = this.model.wallDirAt(hit.wall, hit.proj.along);
+        const n = perp(u);
+        // Stay on the side of the wall the cursor is on, far enough out for the back to touch it.
+        const side = dot(sub(p, hit.proj.point), n) >= 0 ? 1 : -1;
+        const c = add(hit.proj.point, scale(n, side * (hit.wall.thickness / 2 + depth / 2)));
+        const dir = side > 0 ? u : scale(u, -1); // the front (local +y) looks away from the wall
+        return { x: c.x, y: c.y, angle: (angleOf(dir) * 180) / Math.PI, snapped: true };
+      }
+    }
+    const q = this.keys.alt ? p : snapPoint(p, GRID);
+    return { x: q.x, y: q.y, angle: 0, snapped: false };
+  }
+
+  /** Where the handle that turns the selected stairs or furniture sits, in world coordinates. */
+  rotateHandlePos(sel) {
+    const m = this.model;
+    if (!sel) return null;
+    if (sel.kind === 'furniture') {
+      const f = m.getFurniture(sel.id);
+      if (!f || f.level !== m.activeLevel) return null;
+      return add({ x: f.x, y: f.y }, scale(perp(m.furnitureDir(f)), f.depth / 2 + this.px(20)));
+    }
+    if (sel.kind !== 'stairs') return null;
+    const st = m.getStairs(sel.id);
+    if (!st || st.level !== m.activeLevel) return null;
+    const reach = (m.isSpiral(st) ? st.width / 2 : st.length / 2) + this.px(20);
+    return add(m.stairsCentre(st), scale(m.stairsDir(st), reach));
+  }
+
   /** Snap an opening centre so that its start edge sits on the 10 cm grid along the wall. */
   snapAlong(along, width) {
     return this.keys.alt ? along : snap(along - width / 2, GRID) + width / 2;
@@ -271,6 +328,10 @@ export class Editor2D {
           if (dist(this.w2s(h.p), screen) <= 8) return { kind: 'handle', id: o.id, end: h.end };
         }
       }
+    }
+    if (this.selection?.kind === 'furniture' || this.selection?.kind === 'stairs') {
+      const h = this.rotateHandlePos(this.selection);
+      if (h && dist(this.w2s(h), screen) <= 9) return { kind: 'rotate', id: this.selection.id, on: this.selection.kind };
     }
     if (this.selection?.kind === 'wall') {
       const w = m.getWall(this.selection.id);
@@ -312,7 +373,11 @@ export class Editor2D {
       if (proj.dist <= w.thickness / 2 + this.px(3) && proj.dist < bestD) { best = { kind: 'wall', id: w.id }; bestD = proj.dist; }
     }
     if (best) return best;
-    // Stairs and floors: the last drawn is on top.
+    // Furniture, stairs and floors: the last drawn is on top.
+    for (let i = m.furniture.length - 1; i >= 0; i--) {
+      const f = m.furniture[i];
+      if (f.level === L && pointInPolygon(p, m.furnitureFootprint(f))) return { kind: 'furniture', id: f.id };
+    }
     for (let i = m.stairs.length - 1; i >= 0; i--) {
       const st = m.stairs[i];
       if (st.level === L && pointInPolygon(p, m.stairsFootprint(st))) return { kind: 'stairs', id: st.id };
@@ -346,7 +411,7 @@ export class Editor2D {
     c.addEventListener('pointermove', (e) => this.onPointerMove(e));
     c.addEventListener('pointerup', (e) => this.onPointerUp(e));
     c.addEventListener('pointercancel', (e) => this.onPointerUp(e, true));
-    c.addEventListener('pointerleave', () => { if (!this.drag) { this.cursor = null; this.hover = null; this.ghost = null; this.splitPreview = null; this.stairGhost = null; this.fillPreview = null; this.requestRender(); } });
+    c.addEventListener('pointerleave', () => { if (!this.drag) { this.cursor = null; this.hover = null; this.ghost = null; this.splitPreview = null; this.stairGhost = null; this.furnitureGhost = null; this.fillPreview = null; this.requestRender(); } });
     c.addEventListener('dblclick', (e) => this.onDoubleClick(e));
     c.addEventListener('wheel', (e) => {
       e.preventDefault();
@@ -415,6 +480,10 @@ export class Editor2D {
         this.startDrag(e, { kind: 'bulge', id: hit.id });
         return;
       }
+      if (hit.kind === 'rotate') {
+        this.startDrag(e, { kind: 'rotate', id: hit.id, on: hit.on });
+        return;
+      }
       this.setSelection({ kind: hit.kind, id: hit.id });
       if (hit.kind === 'node') this.startDrag(e, { kind: 'node', id: hit.id });
       else if (hit.kind === 'wall') {
@@ -430,6 +499,9 @@ export class Editor2D {
       } else if (hit.kind === 'stairs') {
         const st = this.model.getStairs(hit.id);
         this.startDrag(e, { kind: 'stairs', id: hit.id, start: p, orig: { x: st.x, y: st.y } });
+      } else if (hit.kind === 'furniture') {
+        const f = this.model.getFurniture(hit.id);
+        this.startDrag(e, { kind: 'furniture', id: hit.id, start: p, orig: { x: f.x, y: f.y } });
       }
       return;
     }
@@ -446,10 +518,19 @@ export class Editor2D {
       return;
     }
 
-    if (this.tool === 'stairs') {
+    if (TOOLS[this.tool].stairKind) {
       const q = this.snapDraw(p);
-      const st = this.model.addStairs(q.x, q.y);
+      const st = this.model.addStairs(q.x, q.y, { kind: TOOLS[this.tool].stairKind });
       if (st) { this.commit(); this.setSelection({ kind: 'stairs', id: st.id }); }
+      this.refreshPreview();
+      return;
+    }
+
+    if (TOOLS[this.tool].furniture) {
+      const type = TOOLS[this.tool].furniture;
+      const spot = this.furnitureSpot(type, p);
+      const f = this.model.addFurniture(type, spot.x, spot.y, { angle: spot.angle });
+      if (f) { this.commit(); this.setSelection({ kind: 'furniture', id: f.id }); }
       this.refreshPreview();
       return;
     }
@@ -497,11 +578,14 @@ export class Editor2D {
     if (!this.cursorScreen) { this.requestRender(); return; }
     const p = this.cursor;
     this.hover = null; this.ghost = null; this.splitPreview = null; this.stairGhost = null;
-    this.fillPreview = null;
+    this.furnitureGhost = null; this.fillPreview = null;
     if (this.tool === 'select') this.hover = this.hitTest(this.cursorScreen);
     else if (this.tool === 'fill') this.fillPreview = this.model.roomPolygonAt(p);
     else if (TOOLS[this.tool].opening) this.ghost = this.computeGhost(p);
-    else if (this.tool === 'stairs') this.stairGhost = this.snapDraw(p);
+    else if (TOOLS[this.tool].stairKind) this.stairGhost = { ...this.snapDraw(p), kind: TOOLS[this.tool].stairKind };
+    else if (TOOLS[this.tool].furniture) {
+      this.furnitureGhost = { ...this.furnitureSpot(TOOLS[this.tool].furniture, p), type: TOOLS[this.tool].furniture };
+    }
     else if (this.tool === 'split') {
       const hit = this.wallAt(p);
       if (hit) {
@@ -554,6 +638,26 @@ export class Editor2D {
       case 'floorVertex': {
         const q = this.snapDraw(p);
         m.moveFloorVertex(d.id, d.index, q.x, q.y);
+        break;
+      }
+      case 'furniture': {
+        // Furniture backs onto a wall while it is dragged, just as it does when it is placed.
+        const f = m.getFurniture(d.id);
+        if (!f) break;
+        const spot = this.furnitureSpot(f.type, add(d.orig, sub(p, d.start)), f);
+        if (Math.abs(spot.x - f.x) > EPS || Math.abs(spot.y - f.y) > EPS) m.moveFurniture(d.id, spot.x - f.x, spot.y - f.y);
+        if (spot.snapped && Math.abs(spot.angle - f.angle) > EPS) m.updateFurniture(d.id, { angle: spot.angle });
+        break;
+      }
+      case 'rotate': {
+        const ent = d.on === 'furniture' ? m.getFurniture(d.id) : m.getStairs(d.id);
+        if (!ent) break;
+        const c = d.on === 'furniture' ? { x: ent.x, y: ent.y } : m.stairsCentre(ent);
+        // The furniture handle sits on the front, a quarter turn from the item's own angle.
+        let deg = (angleOf(sub(p, c)) * 180) / Math.PI - (d.on === 'furniture' ? 90 : 0);
+        if (!this.keys.alt) deg = Math.round(deg / ROTATE_SNAP) * ROTATE_SNAP;
+        if (d.on === 'furniture') m.updateFurniture(d.id, { angle: deg });
+        else m.updateStairs(d.id, { angle: deg });
         break;
       }
       case 'bulge': {
@@ -643,6 +747,7 @@ export class Editor2D {
     let hit = this.hitTest(this.cursorScreen);
     if (hit?.kind === 'floorVertex') hit = { kind: 'floor', id: hit.id };
     if (hit?.kind === 'bulge') hit = { kind: 'wall', id: hit.id };
+    if (hit?.kind === 'rotate') hit = { kind: hit.on, id: hit.id };
     if (!hit || hit.kind === 'handle') { this.hideMenu(); return; }
     if (this.tool !== 'select') this.setTool('select');
     this.setSelection({ kind: hit.kind, id: hit.id });
@@ -669,6 +774,7 @@ export class Editor2D {
       }
     }
     if (hit.kind === 'stairs') items.push({ label: 'Rotate 90°', action: () => this.rotateStairs(hit.id) });
+    if (hit.kind === 'furniture') items.push({ label: 'Rotate 90°', action: () => this.rotateFurniture(hit.id) });
     items.push({ label: 'Delete', danger: true, action: () => this.deleteSelection() });
     this.showMenu(this.cursorScreen, items);
   }
@@ -706,6 +812,13 @@ export class Editor2D {
     const st = this.model.getStairs(id);
     if (!st) return;
     this.model.updateStairs(id, { angle: st.angle + 90 });
+    this.commit();
+  }
+
+  rotateFurniture(id) {
+    const f = this.model.getFurniture(id);
+    if (!f) return;
+    this.model.updateFurniture(id, { angle: f.angle + 90 });
     this.commit();
   }
 
@@ -873,7 +986,9 @@ export class Editor2D {
         ? `${pts.length} corners. Click the first corner, double-click or press Enter to close. Esc cancels.`
         : `${pts.length} corner${pts.length === 1 ? '' : 's'}. Keep clicking to add corners. Esc cancels.`;
     }
-    if (this.drag?.kind === 'bulge') hint = 'Drag to bend the wall; drop it back on the chord to straighten it. Alt disables snapping.';
+    if (this.drag?.kind === 'rotate') hint = `Drag to turn it; it snaps to ${ROTATE_SNAP}°. Alt turns it freely.`;
+    else if (this.drag?.kind === 'furniture') hint = 'Drag to move it. Near a wall it backs onto it; Alt moves it freely.';
+    else if (this.drag?.kind === 'bulge') hint = 'Drag to bend the wall; drop it back on the chord to straighten it. Alt disables snapping.';
     else if (this.drag?.kind === 'handle') hint = 'Drag to resize. Shift anchors the opposite edge. Alt disables snapping.';
     else if (this.drag?.kind === 'floorVertex') hint = 'Drag the corner. It snaps to wall corners and the grid; Alt disables snapping.';
     else if (this.drag?.kind === 'opening') hint = 'Slide along the wall, or move close to another wall to jump onto it.';
@@ -917,6 +1032,7 @@ export class Editor2D {
     for (const f of m.floors) if (f.level === L && f.kind !== 'cutout') this.drawFloor(f, state('floor', f.id));
     for (const f of m.floors) if (f.level === L && f.kind === 'cutout') this.drawFloor(f, state('floor', f.id));
     for (const st of m.stairs) if (st.level === L) this.drawStairs(st, state('stairs', st.id));
+    for (const f of m.furniture) if (f.level === L) this.drawFurniture(f, state('furniture', f.id));
 
     const walls = m.walls.filter((w) => w.level === L);
     const polys = computeWallPolygons(m, L);
@@ -1038,7 +1154,33 @@ export class Editor2D {
       this.poly(this.fillPreview.map((q) => this.w2s(q)), this.c.accentSoft, this.c.accent, 1.5);
     }
     if (this.stairGhost) {
-      this.drawStairs({ ...STAIR_DEFAULTS, x: this.stairGhost.x, y: this.stairGhost.y, angle: 0, level: L }, 'ghost');
+      const spec = stairKindSpec(this.stairGhost.kind);
+      this.drawStairs({
+        ...STAIR_DEFAULTS, width: spec.width ?? STAIR_DEFAULTS.width, sweep: spec.sweep,
+        kind: this.stairGhost.kind, x: this.stairGhost.x, y: this.stairGhost.y, angle: 0, level: L,
+      }, 'ghost');
+    }
+    if (this.furnitureGhost) {
+      const g = this.furnitureGhost, spec = furnitureSpec(g.type);
+      this.drawFurniture({
+        type: g.type, x: g.x, y: g.y, angle: g.angle, level: L, elevation: 0,
+        width: spec.width, depth: spec.depth, height: spec.height,
+      }, 'ghost');
+    }
+    // The handle that turns the selected stairs or furniture.
+    if (sel?.kind === 'furniture' || sel?.kind === 'stairs') {
+      const h = this.rotateHandlePos(sel);
+      if (h) {
+        const hs = this.w2s(h);
+        const hot = hov?.kind === 'rotate';
+        ctx.beginPath();
+        ctx.arc(hs.x, hs.y, 5.5, 0, Math.PI * 2);
+        ctx.fillStyle = hot ? this.c.accent : '#ffffff';
+        ctx.fill();
+        ctx.lineWidth = 2;
+        ctx.strokeStyle = this.c.accent;
+        ctx.stroke();
+      }
     }
     if (this.ghost) this.drawGhost(this.ghost);
     if (this.splitPreview) this.drawSplitPreview(this.splitPreview);
@@ -1078,6 +1220,7 @@ export class Editor2D {
     }
     ctx.setLineDash([]);
     for (const st of m.stairs) if (st.level === level) this.drawStairs(st, null, { label: false });
+    for (const f of m.furniture) if (f.level === level) this.drawFurniture(f, null);
     const polys = computeWallPolygons(m, level);
     for (const w of m.walls) {
       const pg = polys.get(w.id);
@@ -1130,16 +1273,33 @@ export class Editor2D {
   /** Stairs: outline, tread lines and an arrow pointing up the flight. state: null | 'hover' | 'selected' | 'ghost'. */
   drawStairs(st, state, { label = true } = {}) {
     const m = this.model;
-    const { steps } = m.stairsInfo(st);
+    const { steps, treadAngle } = m.stairsInfo(st);
     const u = m.stairsDir(st), n = perp(u);
     const edge = state ? this.c.accent : this.c.wallEdge;
     const fill = state === 'ghost' ? this.c.accentSoft : this.c.bg;
-    this.poly(m.stairsFootprint(st).map((q) => this.w2s(q)), fill, edge, state === 'selected' ? 2 : 1);
+    if (m.isSpiral(st)) { this.drawSpiralStairs(st, state, { label, steps, treadAngle, edge, fill }); return; }
+    const open = !stairKindSpec(st.kind).solid;
     const going = st.length / steps, h = st.width / 2;
-    if (going * this.scale >= 2) {
-      for (let i = 1; i < steps; i++) {
-        const c = add(st, scale(u, going * i));
-        this.line(this.w2s(add(c, scale(n, h))), this.w2s(add(c, scale(n, -h))), edge, 0.75);
+    const ctx = this.ctx;
+    if (open) {
+      // Treads in the air: a dashed outline around them, then each tread on its own.
+      ctx.save();
+      ctx.setLineDash([6, 4]);
+      this.poly(m.stairsFootprint(st).map((q) => this.w2s(q)), state === 'ghost' ? fill : null, edge, 1);
+      ctx.restore();
+      const gap = Math.min(going * 0.25, 6);
+      for (let i = 0; i < steps; i++) {
+        const a = add(st, scale(u, going * i + gap / 2)), b = add(st, scale(u, going * (i + 1) - gap / 2));
+        const quad = [add(a, scale(n, h)), add(b, scale(n, h)), add(b, scale(n, -h)), add(a, scale(n, -h))];
+        this.poly(quad.map((q) => this.w2s(q)), fill, edge, 0.75);
+      }
+    } else {
+      this.poly(m.stairsFootprint(st).map((q) => this.w2s(q)), fill, edge, state === 'selected' ? 2 : 1);
+      if (going * this.scale >= 2) {
+        for (let i = 1; i < steps; i++) {
+          const c = add(st, scale(u, going * i));
+          this.line(this.w2s(add(c, scale(n, h))), this.w2s(add(c, scale(n, -h))), edge, 0.75);
+        }
       }
     }
     // Arrow up the centre line, from the bottom step to the top.
@@ -1152,6 +1312,78 @@ export class Editor2D {
       this.line(b, q, edge, 1.5);
     }
     if (label && state !== 'ghost') this.pill('UP', a.x, a.y, state === 'selected', angleOf(u));
+  }
+
+  /** A spiral flight: the outer circle, a radial line per tread, the post and a curved arrow. */
+  drawSpiralStairs(st, state, { label, steps, treadAngle, edge, fill }) {
+    const m = this.model;
+    const ctx = this.ctx;
+    const c = this.w2s({ x: st.x, y: st.y });
+    const r = (st.width / 2) * this.scale;
+    ctx.beginPath();
+    ctx.arc(c.x, c.y, r, 0, Math.PI * 2);
+    if (fill) { ctx.fillStyle = fill; ctx.fill(); }
+    ctx.strokeStyle = edge;
+    ctx.lineWidth = state === 'selected' ? 2 : 1;
+    ctx.stroke();
+    const a0 = (st.angle * Math.PI) / 180;
+    const step = (treadAngle * Math.PI) / 180;
+    const post = Math.max(2, (SPIRAL_POST / 2) * this.scale);
+    for (let i = 0; i <= steps; i++) {
+      const a = a0 + step * i;
+      this.line(
+        { x: c.x + Math.cos(a) * post, y: c.y + Math.sin(a) * post },
+        { x: c.x + Math.cos(a) * r, y: c.y + Math.sin(a) * r },
+        edge, 0.75,
+      );
+    }
+    ctx.beginPath();
+    ctx.arc(c.x, c.y, post, 0, Math.PI * 2);
+    ctx.fillStyle = edge;
+    ctx.fill();
+    // Arrow along the walking line, from the first tread to the last.
+    const walk = r * 0.7;
+    ctx.beginPath();
+    ctx.arc(c.x, c.y, walk, a0 + step * 0.5, a0 + step * (steps - 0.5), step < 0);
+    ctx.strokeStyle = edge;
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+    const aEnd = a0 + step * (steps - 0.5);
+    const tip = { x: c.x + Math.cos(aEnd) * walk, y: c.y + Math.sin(aEnd) * walk };
+    const dir = angleOf({ x: -Math.sin(aEnd) * Math.sign(step), y: Math.cos(aEnd) * Math.sign(step) });
+    for (const k of [-1, 1]) {
+      this.line(tip, { x: tip.x - Math.cos(dir + k * 0.45) * 8, y: tip.y - Math.sin(dir + k * 0.45) * 8 }, edge, 1.5);
+    }
+    if (label && state !== 'ghost') {
+      const aStart = a0 + step * 0.5;
+      this.pill('UP', c.x + Math.cos(aStart) * walk, c.y + Math.sin(aStart) * walk, state === 'selected');
+    }
+  }
+
+  /** A piece of furniture: its footprint, the parts seen from above, and a thicker front edge. */
+  drawFurniture(f, state) {
+    const m = this.model;
+    const u = m.furnitureDir(f), n = perp(u);
+    const c = { x: f.x, y: f.y };
+    const edge = state ? this.c.accent : this.c.wallEdge;
+    const fill = state === 'ghost' ? this.c.accentSoft : this.c.furniture;
+    const corners = (o, w, d) => [[-1, -1], [1, -1], [1, 1], [-1, 1]]
+      .map(([sx, sy]) => this.w2s(add(add(o, scale(u, (sx * w) / 2)), scale(n, (sy * d) / 2))));
+    this.poly(corners(c, f.width, f.depth), fill, edge, state === 'selected' ? 2 : 1);
+    // The parts, lowest first, so a table top covers its legs.
+    if (Math.min(f.width, f.depth) * this.scale >= 16) {
+      for (const q of [...furnitureParts(f.type, f)].sort((a, b) => a.z - b.z)) {
+        const o = add(add(c, scale(u, q.x)), scale(n, q.y));
+        this.poly(corners(o, q.w, q.d), null, edge, 0.75);
+      }
+    }
+    // Front edge, so the facing is readable at a glance.
+    const front = scale(n, f.depth / 2);
+    this.line(
+      this.w2s(add(add(c, scale(u, -f.width * 0.32)), front)),
+      this.w2s(add(add(c, scale(u, f.width * 0.32)), front)),
+      edge, state === 'selected' ? 2.5 : 1.75,
+    );
   }
 
   drawFloorPreview() {

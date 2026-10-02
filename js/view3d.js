@@ -2,7 +2,7 @@
 
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
-import { openingDims, openingSpec, wallSpec, RAILING } from './catalog.js';
+import { openingDims, openingSpec, wallSpec, stairKindSpec, RAILING, TREAD, SPIRAL_POST, furnitureParts } from './catalog.js';
 
 const FRAME = 5;       // window / door frame width, cm
 const LEAF = 4;        // door leaf thickness, cm
@@ -78,6 +78,11 @@ export class View3D {
       floor: new THREE.MeshStandardMaterial({ color: 0xd8c8a8, roughness: 0.85 }),
       stairs: new THREE.MeshStandardMaterial({ color: 0xc9b08a, roughness: 0.75 }),
       rail: new THREE.MeshStandardMaterial({ color: 0x9aa3ad, roughness: 0.4, metalness: 0.35 }),
+      // Furniture materials, named by the `mat` of a catalog part.
+      case: new THREE.MeshStandardMaterial({ color: 0xb08a5e, roughness: 0.7 }),
+      top: new THREE.MeshStandardMaterial({ color: 0xe0d6c4, roughness: 0.6 }),
+      soft: new THREE.MeshStandardMaterial({ color: 0x8e9aa8, roughness: 0.95 }),
+      white: new THREE.MeshStandardMaterial({ color: 0xf2f4f6, roughness: 0.3 }),
     };
     // Glass never casts a shadow, wherever it is used.
     this.mats.glass.userData.noShadow = true;
@@ -347,6 +352,26 @@ export class View3D {
     for (const st of m.stairs) {
       if (st.level === level.id) this.addStairs(parent, st, sel?.kind === 'stairs' && sel.id === st.id ? mats.wallSel : mats.stairs);
     }
+    for (const f of m.furniture) {
+      if (f.level === level.id) this.addFurniture(parent, f, mats, sel?.kind === 'furniture' && sel.id === f.id);
+    }
+  }
+
+  /** A piece of furniture: one box per catalog part, in the item's own frame. */
+  addFurniture(parent, f, mats, selected) {
+    const g = new THREE.Group();
+    g.position.set(f.x, f.elevation || 0, f.y);
+    g.rotation.y = -(f.angle * Math.PI) / 180;
+    parent.add(g);
+    for (const q of furnitureParts(f.type, f)) {
+      // Catalog parts are x along the width, y along the depth (world z) and z up.
+      const mat = selected ? mats.wallSel : (mats[q.mat] || mats.case);
+      const mesh = new THREE.Mesh(new THREE.BoxGeometry(q.w, q.h, q.d), mat);
+      mesh.position.set(q.x, q.z + q.h / 2, q.y);
+      mesh.castShadow = !mat.userData.ghost && !mat.userData.noShadow;
+      mesh.receiveShadow = !mat.userData.ghost;
+      g.add(mesh);
+    }
   }
 
   /**
@@ -401,16 +426,46 @@ export class View3D {
     parent.add(mesh);
   }
 
-  /** Stairs as a stepped solid: one box per step, each from the floor up to its tread. */
+  /**
+   * Stairs: a stepped solid, the same flight as floating treads, or a spiral of treads about a
+   * central post.
+   */
   addStairs(parent, st, mat) {
-    const { steps, riser, going } = this.model.stairsInfo(st);
-    const u = this.model.stairsDir(st);
+    const m = this.model;
+    const { steps, riser, going, treadAngle } = m.stairsInfo(st);
+    if (m.isSpiral(st)) {
+      const r = st.width / 2;
+      const post = new THREE.Group();
+      post.position.set(st.x, 0, st.y);
+      parent.add(post);
+      this.box(post, -SPIRAL_POST / 2, SPIRAL_POST / 2, 0, steps * riser, SPIRAL_POST, mat);
+      for (let i = 0; i < steps; i++) {
+        const g = new THREE.Group();
+        g.position.set(st.x, 0, st.y);
+        g.rotation.y = -((st.angle + treadAngle * i) * Math.PI) / 180;
+        parent.add(g);
+        // A tread reaches from the post to the outer radius, as wide as its share of the turn.
+        const w = Math.max(10, 2 * r * Math.sin(Math.abs((treadAngle * Math.PI) / 180) / 2));
+        const y = (i + 1) * riser;
+        const span = new THREE.Group();
+        span.rotation.y = -((treadAngle / 2) * Math.PI) / 180;
+        g.add(span);
+        this.box(span, SPIRAL_POST / 2, r, y - TREAD, y, w, mat);
+      }
+      return;
+    }
+    const u = m.stairsDir(st);
     // Local frame like a wall: x up the flight from (x, y), y up, z across the width.
     const g = new THREE.Group();
     g.position.set(st.x, 0, st.y);
     g.rotation.y = -Math.atan2(u.y, u.x);
     parent.add(g);
-    for (let i = 0; i < steps; i++) this.box(g, i * going, (i + 1) * going, 0, (i + 1) * riser, st.width, mat);
+    const open = !stairKindSpec(st.kind).solid;
+    for (let i = 0; i < steps; i++) {
+      const y = (i + 1) * riser;
+      if (open) this.box(g, i * going, (i + 1) * going, y - TREAD, y, st.width, mat);
+      else this.box(g, i * going, (i + 1) * going, 0, y, st.width, mat);
+    }
   }
 
   /** What fills an opening: door leaves and frame, or window frame, mullions and glass. */

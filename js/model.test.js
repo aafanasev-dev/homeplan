@@ -5,7 +5,10 @@ import {
   snap, projectOnSegment, lineIntersect, dist, pointInPolygon, polygonArea,
   arcFromChord, arcPointAt, arcProject, arcSamples, arcOffset, sagittaThrough, splineBulges,
 } from './geometry.js';
-import { openingDims, openingSpec, OPENING_TYPES, WALL_STYLES, wallSpec, BARRIER_HEIGHT, MIN_OPENING_WIDTH } from './catalog.js';
+import {
+  openingDims, openingSpec, OPENING_TYPES, WALL_STYLES, wallSpec, BARRIER_HEIGHT, MIN_OPENING_WIDTH,
+  STAIR_KINDS, FURNITURE_TYPES, furnitureSpec, furnitureParts,
+} from './catalog.js';
 
 const tests = [];
 const test = (name, fn) => tests.push({ name, fn });
@@ -366,12 +369,14 @@ test('load drops entities on unknown levels and walls across levels', () => {
     nodes: [{ id: 'n1', x: 0, y: 0, level: 'l1' }, { id: 'n2', x: 100, y: 0, level: 'l2' }, { id: 'n3', x: 0, y: 0, level: 'lX' }],
     walls: [{ id: 'w1', a: 'n1', b: 'n2' }],
     floors: [{ id: 'f1', level: 'lX', points: [{ x: 0, y: 0 }, { x: 100, y: 0 }, { x: 100, y: 100 }] }],
-    stairs: [{ id: 's1', level: 'l2', x: 0, y: 0, angle: 95 }],
+    stairs: [{ id: 's1', level: 'l2', x: 0, y: 0, angle: 95 }, { id: 's2', level: 'l2', x: 0, y: 0, angle: -30 }],
   });
   eq(m.nodes.length, 2, 'node on unknown level dropped');
   eq(m.walls.length, 0, 'wall across levels dropped');
   eq(m.floors.length, 0, 'floor on unknown level dropped');
-  eq(m.stairs.length, 1); eq(m.stairs[0].angle, 90, 'angle snapped to a quarter turn');
+  eq(m.stairs.length, 2);
+  eq(m.stairs[0].angle, 95, 'any angle is kept');
+  eq(m.stairs[1].angle, 330, 'and normalised into 0 .. 359');
 });
 
 test('addLevel stacks levels and levelElevation sums the heights below', () => {
@@ -775,6 +780,131 @@ test('a barrier can hold an opening and still bound a room', () => {
   const d = openingDims('door', m.getWall(walls[2].id).height);
   eq(d.height, BARRIER_HEIGHT, 'clamped to the height of the barrier');
   eq(d.sill, 0);
+});
+
+// ------------------------------------------------------------------ open and spiral stairs
+
+test('stairs come in three kinds and keep their place when the kind changes', () => {
+  const m = new Model();
+  const open = m.addStairs(100, 100, { kind: 'open' });
+  eq(open.kind, 'open');
+  eq(open.sweep, undefined, 'only a spiral has a sweep');
+  nearPt(m.stairsFootprint(open)[0], { x: 100, y: 150 }, 'an open flight has the same footprint as a solid one');
+  const sp = m.addStairs(500, 500, { kind: 'spiral' });
+  eq(sp.kind, 'spiral'); eq(sp.width, STAIR_KINDS.spiral.width); eq(sp.sweep, STAIR_KINDS.spiral.sweep);
+  const fp = m.stairsFootprint(sp);
+  eq(fp.length, 16, 'a spiral footprint is a circle');
+  for (const q of fp) near(dist(q, { x: 500, y: 500 }), sp.width / 2, 'on the outer radius');
+  const info = m.stairsInfo(sp);
+  near(info.treadAngle, sp.sweep / info.steps, 'turn per step');
+  assert(info.going > 0 && info.going < sp.width, 'tread at the walking line');
+  eq(m.stairsInfo(open).treadAngle, 0, 'a straight flight does not turn');
+  // Switching kinds keeps the flight where it is.
+  const centre = m.stairsCentre(open);
+  m.updateStairs(open.id, { kind: 'spiral' });
+  nearPt(m.stairsCentre(open), centre, 'straight -> spiral');
+  m.updateStairs(open.id, { kind: 'straight' });
+  nearPt(m.stairsCentre(open), centre, 'spiral -> straight');
+  eq(open.kind, undefined, 'a straight flight stores no kind');
+  eq(open.sweep, undefined, 'and no sweep');
+});
+
+test('a spiral cuts a round stairwell, and stairs take any angle', () => {
+  const m = new Model();
+  const sp = m.addStairs(300, 200, { kind: 'spiral', width: 160 });
+  const l2 = m.addLevel().id;
+  m.setActiveLevel(l2);
+  const f = m.addFloor([{ x: 0, y: 0 }, { x: 600, y: 0 }, { x: 600, y: 400 }, { x: 0, y: 400 }]);
+  eq(m.floorHoles(f).length, 1, 'the spiral cuts the floor above');
+  eq(m.floorHoles(f)[0].length, 16, 'as a circle');
+  m.updateStairs(sp.id, { width: 900 }); // now it sticks out of the floor
+  eq(m.floorHoles(f).length, 0, 'a stairwell has to fit inside the floor');
+  m.setActiveLevel(m.levels[0].id);
+  const st = m.addStairs(0, 0);
+  const centre = m.stairsCentre(st);
+  m.updateStairs(st.id, { angle: 30 });
+  eq(st.angle, 30, 'any angle');
+  nearPt(m.stairsCentre(st), centre, 'and it turns about its own centre');
+  m.updateStairs(st.id, { angle: -30 });
+  eq(st.angle, 330, 'normalised');
+  const json = m.serialize();
+  const m2 = new Model(json);
+  eq(m2.serialize(), json, 'round trip');
+  eq(m2.stairs[0].kind, 'spiral');
+  const m3 = new Model({ version: 2, stairs: [{ id: 's1', x: 0, y: 0, kind: 'nonsense' }] });
+  eq(m3.stairs[0].kind, undefined, 'an unknown kind loads as a straight flight');
+});
+
+// ------------------------------------------------------------------ furniture
+
+test('furniture takes its size from the catalog and can be resized or retyped', () => {
+  const m = new Model();
+  eq(m.addFurniture('nope', 0, 0), null, 'unknown type');
+  const bed = m.addFurniture('bed_double', 100, 200);
+  const spec = furnitureSpec('bed_double');
+  eq(bed.type, 'bed_double'); eq(bed.width, spec.width); eq(bed.depth, spec.depth); eq(bed.height, spec.height);
+  eq(bed.angle, 0); eq(bed.elevation, 0); eq(bed.level, m.activeLevel);
+  const cab = m.addFurniture('kitchen_wall', 0, 0);
+  eq(cab.elevation, 140, 'a wall cabinet hangs at its catalog height');
+  const custom = m.addFurniture('chair', 0, 0, { width: 9999, angle: 400 });
+  eq(custom.width, 1000, 'size clamped'); eq(custom.angle, 40, 'angle normalised');
+  m.updateFurniture(bed.id, { type: 'bedside_table' });
+  eq(bed.width, furnitureSpec('bedside_table').width, 'a new type brings its size');
+  nearPt(bed, { x: 100, y: 200 }, 'and stays where it was');
+  m.updateFurniture(bed.id, { width: 50, angle: 15 });
+  eq(bed.width, 50); eq(bed.angle, 15);
+  m.moveFurniture(bed.id, 10, -10);
+  nearPt(bed, { x: 110, y: 190 });
+  assert(m.deleteEntity('furniture', bed.id)); eq(m.furniture.length, 2);
+});
+
+test('a furniture footprint follows its angle', () => {
+  const m = new Model();
+  const f = m.addFurniture('bed', 0, 0); // 90 wide, 200 deep, front at +y
+  const fp = m.furnitureFootprint(f);
+  nearPt(fp[0], { x: -45, y: -100 }, 'back left'); nearPt(fp[2], { x: 45, y: 100 }, 'front right');
+  m.updateFurniture(f.id, { angle: 90 });
+  const turned = m.furnitureFootprint(f);
+  near(Math.max(...turned.map((q) => q.x)) - Math.min(...turned.map((q) => q.x)), 200, 'the depth now runs along x');
+  near(Math.max(...turned.map((q) => q.y)) - Math.min(...turned.map((q) => q.y)), 90);
+  const b = m.bounds(m.activeLevel);
+  near(b.minX, -100, 'bounds cover the furniture');
+});
+
+test('every catalog piece is built from parts inside its box', () => {
+  for (const [type, spec] of Object.entries(FURNITURE_TYPES)) {
+    const size = { width: spec.width, depth: spec.depth, height: spec.height };
+    const parts = furnitureParts(type, size);
+    assert(parts.length > 0, `${type} has parts`);
+    for (const q of parts) {
+      assert(q.w > 0 && q.d > 0 && q.h > 0, `${type}: a part has a size`);
+      assert(Math.abs(q.x) + q.w / 2 <= size.width / 2 + 1e-6, `${type}: part inside the width`);
+      assert(Math.abs(q.y) + q.d / 2 <= size.depth / 2 + 1e-6, `${type}: part inside the depth`);
+      assert(q.z >= -1e-6 && q.z + q.h <= size.height + 1e-6, `${type}: part inside the height`);
+    }
+  }
+});
+
+test('furniture survives levels, serialisation and deletion', () => {
+  const m = new Model();
+  const l1 = m.activeLevel;
+  m.addFurniture('sofa', 100, 100, { angle: 45 });
+  const l2 = m.addLevel().id;
+  m.setActiveLevel(l2);
+  m.addFurniture('bath', 50, 50);
+  eq(m.furniture.length, 2);
+  eq(m.levelOfEntity('furniture', m.furniture[1].id), l2);
+  const json = m.serialize();
+  const m2 = new Model(json);
+  eq(m2.serialize(), json, 'round trip');
+  eq(m2.furniture.length, 2); eq(m2.furniture[0].angle, 45);
+  const fresh = m2.addFurniture('chair', 0, 0);
+  assert(!m2.furniture.slice(0, 2).some((f) => f.id === fresh.id), 'ids stay unique after a load');
+  m2.deleteLevel(l2);
+  eq(m2.furniture.length, 2, 'deleting a level takes its furniture (the sofa and the new chair stay)');
+  assert(m2.furniture.every((f) => f.level === l1), 'nothing is left on the deleted level');
+  const bad = new Model({ version: 2, furniture: [{ id: 'u1', type: 'nope', x: 0, y: 0 }, { id: 'u2', type: 'chair', x: 1, y: 2 }] });
+  eq(bad.furniture.length, 1, 'an unknown type is dropped on load');
 });
 
 /** Run every test. Returns { passed, failed, results: [{ name, ok, error }] }. */

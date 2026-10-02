@@ -2,7 +2,10 @@
 
 import { Model, History, createSampleModel } from './model.js';
 import { Editor2D, TOOLS } from './editor2d.js';
-import { OPENING_TYPES, MIN_OPENING_WIDTH, openingDims, openingSpec, WALL_STYLES, wallSpec } from './catalog.js';
+import {
+  OPENING_TYPES, MIN_OPENING_WIDTH, openingDims, openingSpec, WALL_STYLES, wallSpec,
+  STAIR_KINDS, stairKindSpec, FURNITURE_TYPES, furnitureSpec,
+} from './catalog.js';
 import { round } from './geometry.js';
 
 const STORAGE_KEY = 'homeplan.plan.v1';
@@ -322,6 +325,7 @@ function renderProps(force = false) {
       ${readout('Floors', model.floors.filter((f) => f.level === L && f.kind !== 'cutout').length)}
       ${readout('Cutouts', model.floors.filter((f) => f.level === L && f.kind === 'cutout').length)}
       ${readout('Stairs', model.stairs.filter((st) => st.level === L).length)}
+      ${readout('Furniture', model.furniture.filter((f) => f.level === L).length)}
       ${readout('Total wall length', `${round(total / 100, 2)} m`)}
       ${model.levels.length > 1 ? '<div class="actions"><button type="button" class="danger" data-prop-action="delete-level">Delete level</button></div>' : ''}
       <p class="hint">Counts are for this level. Select a wall, corner, door, window, floor or stairs to edit it. Placement snaps to a 10 cm grid; hold Alt to place freely.</p>
@@ -416,21 +420,45 @@ function renderProps(force = false) {
   } else if (sel.kind === 'stairs') {
     const st = ent;
     const info = model.stairsInfo(st);
-    const angles = [[0, 'Right (0°)'], [90, 'Down (90°)'], [180, 'Left (180°)'], [270, 'Up (270°)']]
-      .map(([a, label]) => `<option value="${a}"${a === st.angle ? ' selected' : ''}>${label}</option>`).join('');
-    html = `<h2>Stairs</h2>
-      ${field('Width (cm)', numInput('width', st.width, { min: 30, max: 1000, step: 10 }))}
-      ${field('Length (cm)', numInput('length', st.length, { min: 50, max: 2000, step: 10 }))}
-      ${field('Climbs towards', `<select name="angle">${angles}</select>`)}
+    const spiral = model.isSpiral(st);
+    const kinds = Object.entries(STAIR_KINDS)
+      .map(([k, c]) => `<option value="${k}"${k === (st.kind || 'straight') ? ' selected' : ''}>${c.label}</option>`).join('');
+    html = `<h2>${stairKindSpec(st.kind).label}</h2>
+      ${field('Kind', `<select name="kind">${kinds}</select>`)}
+      ${spiral
+        ? field('Diameter (cm)', numInput('width', st.width, { min: 30, max: 1000, step: 10 }))
+          + field('Turn (°)', numInput('sweep', st.sweep ?? STAIR_KINDS.spiral.sweep, { min: -720, max: 720, step: 15 }))
+        : field('Width (cm)', numInput('width', st.width, { min: 30, max: 1000, step: 10 }))
+          + field('Length (cm)', numInput('length', st.length, { min: 50, max: 2000, step: 10 }))}
+      ${field('Angle (°)', numInput('angle', st.angle, { min: -360, max: 360, step: 15 }))}
       ${readout('Rise', fmt(info.rise))}
       ${readout('Steps', info.steps)}
       ${readout('Step height', fmt(info.riser))}
-      ${readout('Step depth', fmt(info.going))}
+      ${readout(spiral ? 'Tread at walking line' : 'Step depth', fmt(info.going))}
+      ${spiral ? readout('Turn per step', `${round(info.treadAngle, 1)}°`) : ''}
       <div class="actions">
         <button type="button" data-prop-action="rotate">Rotate 90°</button>
         <button type="button" class="danger" data-prop-action="delete">Delete</button>
       </div>
-      <p class="hint">The flight climbs to the level above and cuts a stairwell in a floor there that contains it.</p>`;
+      <p class="hint">The flight climbs to the level above and cuts a stairwell in a floor there that contains it. Drag the round handle to turn it; it snaps to 15°.</p>`;
+  } else if (sel.kind === 'furniture') {
+    const f = ent;
+    const spec = furnitureSpec(f.type);
+    const types = Object.entries(FURNITURE_TYPES)
+      .map(([k, c]) => `<option value="${k}"${k === f.type ? ' selected' : ''}>${c.label}</option>`).join('');
+    html = `<h2>${spec.label}</h2>
+      ${field('Type', `<select name="type">${types}</select>`)}
+      ${field('Width (cm)', numInput('width', f.width, { min: 5, max: 1000, step: 5 }))}
+      ${field('Depth (cm)', numInput('depth', f.depth, { min: 5, max: 1000, step: 5 }))}
+      ${field('Height (cm)', numInput('height', f.height, { min: 5, max: 1000, step: 5 }))}
+      ${field('Elevation (cm)', numInput('elevation', f.elevation, { min: 0, max: 2000, step: 10 }))}
+      ${field('Angle (°)', numInput('angle', f.angle, { min: -360, max: 360, step: 15 }))}
+      ${readout('Footprint', `${round((f.width * f.depth) / 10000, 2)} m²`)}
+      <div class="actions">
+        <button type="button" data-prop-action="rotate">Rotate 90°</button>
+        <button type="button" class="danger" data-prop-action="delete">Delete</button>
+      </div>
+      <p class="hint">Drag it to move; dropped near a wall it turns and backs onto it (hold Alt to place it freely). Drag the round handle to turn it; it snaps to 15°.</p>`;
   }
   body.innerHTML = html;
 }
@@ -453,6 +481,7 @@ $('#props-body').addEventListener('change', (e) => {
   if (sel.kind === 'wall') model.updateWall(sel.id, { [el.name]: v });
   else if (sel.kind === 'floor') model.updateFloor(sel.id, { [el.name]: v });
   else if (sel.kind === 'stairs') model.updateStairs(sel.id, { [el.name]: v });
+  else if (sel.kind === 'furniture') model.updateFurniture(sel.id, { [el.name]: v });
   else if (sel.kind === 'opening') model.updateOpening(sel.id, { [el.name]: v });
   else if (sel.kind === 'node') {
     const n = model.getNode(sel.id);
@@ -473,7 +502,10 @@ $('#props-body').addEventListener('click', (e) => {
   if (!sel) return;
   switch (b.dataset.propAction) {
     case 'delete': editor.deleteSelection(); break;
-    case 'rotate': editor.rotateStairs(sel.id); break;
+    case 'rotate':
+      if (sel.kind === 'furniture') editor.rotateFurniture(sel.id);
+      else editor.rotateStairs(sel.id);
+      break;
     case 'split': editor.splitSelectedInHalf(); break;
     case 'straighten':
       model.updateWall(sel.id, { bulge: 0 });
