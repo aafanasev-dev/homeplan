@@ -5,7 +5,7 @@ import {
   snap, projectOnSegment, lineIntersect, dist, pointInPolygon, polygonArea,
   arcFromChord, arcPointAt, arcProject, arcSamples, arcOffset, sagittaThrough, splineBulges,
 } from './geometry.js';
-import { openingDims, openingSpec, OPENING_TYPES, MIN_OPENING_WIDTH } from './catalog.js';
+import { openingDims, openingSpec, OPENING_TYPES, WALL_STYLES, wallSpec, BARRIER_HEIGHT, MIN_OPENING_WIDTH } from './catalog.js';
 
 const tests = [];
 const test = (name, fn) => tests.push({ name, fn });
@@ -705,6 +705,76 @@ test('roomPolygonAt traces the room under a point', () => {
   assert(area(bowed) > straight, 'and the room grew');
   m.updateWall(walls[3].id, { bulge: 100 });
   assert(area(m.roomPolygonAt({ x: 150, y: 200 })) < straight, 'bowing the other way shrinks it');
+});
+
+// ------------------------------------------------------------------ barriers (wall styles)
+
+test('a barrier is a wall with its own height and thickness', () => {
+  const m = new Model();
+  const plain = m.addWall({ x: 0, y: 0 }, { x: 400, y: 0 });
+  eq('style' in plain, false, 'a plain wall stores no style');
+  eq(plain.height, m.getLevel(plain.level).height, 'and reaches the level height');
+  eq(plain.thickness, WALL_STYLES.wall.thickness);
+  for (const style of ['barrier_full', 'barrier_glass', 'barrier_railing']) {
+    const b = m.addWall({ x: 0, y: m.walls.length * 100 + 100 }, { x: 400, y: m.walls.length * 100 + 100 }, { style });
+    eq(b.style, style, style);
+    eq(b.height, BARRIER_HEIGHT, `${style} height`);
+    eq(b.thickness, WALL_STYLES[style].thickness, `${style} thickness`);
+    assert(wallSpec(b.style).barrier, `${style} is a barrier`);
+  }
+  // Explicit values still win.
+  const custom = m.addWall({ x: 0, y: 900 }, { x: 400, y: 900 }, { style: 'barrier_full', height: 140, thickness: 20 });
+  eq(custom.height, 140); eq(custom.thickness, 20);
+});
+
+test('changing the style of a wall brings the new proportions', () => {
+  const m = new Model();
+  const w = m.addWall({ x: 0, y: 0 }, { x: 400, y: 0 });
+  const levelHeight = m.getLevel(w.level).height;
+  m.updateWall(w.id, { style: 'barrier_railing' });
+  eq(w.style, 'barrier_railing'); eq(w.height, BARRIER_HEIGHT); eq(w.thickness, WALL_STYLES.barrier_railing.thickness);
+  m.updateWall(w.id, { style: 'wall' });
+  eq('style' in w, false, 'back to a plain wall');
+  eq(w.height, levelHeight, 'and back to the level height');
+  m.updateWall(w.id, { style: 'barrier_glass', height: 90 });
+  eq(w.height, 90, 'an explicit height wins over the style default');
+  m.updateWall(w.id, { thickness: 30 });
+  eq(w.style, 'barrier_glass', 'other edits leave the style alone');
+  eq(m.updateWall(w.id, { style: 'nonsense' }), true);
+  eq(w.style, 'barrier_glass', 'an unknown style is ignored');
+});
+
+test('barriers split, curve, serialise and keep clear of level height changes', () => {
+  const m = new Model();
+  const w = m.addWall({ x: 0, y: 0 }, { x: 400, y: 0 }, { style: 'barrier_railing', bulge: 60 });
+  const halves = m.splitWall(w.id, { x: 200, y: 200 }).walls;
+  for (const h of halves) { eq(h.style, 'barrier_railing', 'the style survives a split'); eq(h.height, BARRIER_HEIGHT); }
+  const plain = m.addWall({ x: 0, y: 300 }, { x: 400, y: 300 });
+  m.updateLevel(m.activeLevel, { height: 300 });
+  eq(plain.height, 300, 'a full-height wall follows the level');
+  eq(halves[0].height, BARRIER_HEIGHT, 'a barrier keeps its own height');
+  const json = m.serialize();
+  const m2 = new Model(json);
+  eq(m2.serialize(), json, 'round trip');
+  eq(m2.walls[0].style, 'barrier_railing');
+  const m3 = new Model({ version: 2, nodes: [{ id: 'n1', x: 0, y: 0 }, { id: 'n2', x: 100, y: 0 }],
+    walls: [{ id: 'w1', a: 'n1', b: 'n2', style: 'what' }] });
+  eq('style' in m3.walls[0], false, 'an unknown style loads as a plain wall');
+});
+
+test('a barrier can hold an opening and still bound a room', () => {
+  const m = new Model();
+  const pts = [{ x: 0, y: 0 }, { x: 600, y: 0 }, { x: 600, y: 400 }, { x: 0, y: 400 }];
+  const walls = pts.map((p, i) => m.addWall(p, pts[(i + 1) % 4]));
+  m.updateWall(walls[2].id, { style: 'barrier_railing' });
+  const room = m.roomPolygonAt({ x: 300, y: 200 });
+  assert(room, 'the railing still closes the room');
+  near(area(room), (600 - 15) * (400 - (15 + WALL_STYLES.barrier_railing.thickness) / 2), 'up to the inner faces');
+  const o = m.addOpening(walls[2].id, 'door', 300);
+  assert(o, 'a gap can be cut in a railing');
+  const d = openingDims('door', m.getWall(walls[2].id).height);
+  eq(d.height, BARRIER_HEIGHT, 'clamped to the height of the barrier');
+  eq(d.sill, 0);
 });
 
 /** Run every test. Returns { passed, failed, results: [{ name, ok, error }] }. */

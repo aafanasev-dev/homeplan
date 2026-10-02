@@ -5,7 +5,7 @@ import {
   pointInPolygon, polygonArea, arcFromChord, arcPointAt, arcSamples, arcOffset, splineBulges,
 } from './geometry.js';
 import { computeWallPolygons } from './model.js';
-import { OPENING_TYPES, STAIR_DEFAULTS, openingSpec } from './catalog.js';
+import { OPENING_TYPES, STAIR_DEFAULTS, openingSpec, wallSpec } from './catalog.js';
 
 const OPENING_SNAP_DIST = 40; // cm: how close the cursor must be to a wall to place an opening
 const DRAG_THRESHOLD = 3;     // px before a press becomes a drag
@@ -15,8 +15,11 @@ const GHOST_ALPHA = 0.3;      // opacity of the level below
 
 export const TOOLS = {
   select:      { label: 'Select',             key: 'v', hint: 'Click to select, drag to move. Double-click a wall to split it. Drag empty space to pan.' },
-  wall:        { label: 'Wall',               key: 'w', hint: 'Click to start, click to add corners. Esc, right-click or double-click ends the chain. Shift keeps it straight.' },
-  curve:       { label: 'Curved wall',        key: 'c', hint: 'Click to add points; the walls bend along a spline through them. Esc, right-click or double-click ends the chain.' },
+  wall:        { label: 'Wall',               key: 'w', wallStyle: 'wall', hint: 'Click to start, click to add corners. Esc, right-click or double-click ends the chain. Shift keeps it straight.' },
+  curve:       { label: 'Curved wall',        key: 'c', wallStyle: 'wall', hint: 'Click to add points; the walls bend along a spline through them. Esc, right-click or double-click ends the chain.' },
+  barrier:         { label: 'Barrier',        key: 'b', wallStyle: 'barrier_full',    hint: 'Draws a low solid wall (100 cm). Click to add corners; Esc, right-click or double-click ends the chain.' },
+  barrier_glass:   { label: 'Glass barrier',            wallStyle: 'barrier_glass',   hint: 'Draws a thin glass barrier (100 cm). Click to add corners; Esc, right-click or double-click ends the chain.' },
+  barrier_railing: { label: 'Railing',                  wallStyle: 'barrier_railing', hint: 'Draws a railing (100 cm): a top bar on posts. Click to add corners; Esc, right-click or double-click ends the chain.' },
   split:       { label: 'Split',              key: 's', hint: 'Click on a wall to split it into two segments.' },
   floor:       { label: 'Floor',              key: 'g', hint: 'Click to add corners. Click the first corner, double-click or press Enter to close; Esc cancels. Shift keeps edges straight.' },
   fill:        { label: 'Floor fill',         key: 'r', hint: 'Click inside a room closed by walls to fill it with a floor in one click.' },
@@ -103,6 +106,7 @@ export class Editor2D {
       text: v('--plan-text', '#1f2329'),
       pill: v('--plan-pill', 'rgba(255,255,255,0.9)'),
       floor: v('--plan-floor', '#efe9dd'),
+      barrier: v('--plan-barrier', '#767d89'),
     };
   }
 
@@ -219,6 +223,9 @@ export class Editor2D {
 
   /** True for the tools that draw an outline corner by corner (floor, cutout). */
   isOutlineTool() { return this.tool === 'floor' || this.tool === 'cutout'; }
+
+  /** True for the tools that draw walls or barriers as a chain of clicks. */
+  isWallTool() { return !!TOOLS[this.tool].wallStyle; }
 
   // ---------------------------------------------------------------- snapping helpers
 
@@ -427,7 +434,7 @@ export class Editor2D {
       return;
     }
 
-    if (this.tool === 'wall' || this.tool === 'curve') { this.wallClick(p); return; }
+    if (this.isWallTool()) { this.wallClick(p); return; }
     if (this.isOutlineTool()) { this.floorClick(p); return; }
 
     if (this.tool === 'fill') {
@@ -618,7 +625,7 @@ export class Editor2D {
 
   onDoubleClick(e) {
     this.updatePointer(e);
-    if (this.tool === 'wall' || this.tool === 'curve') { this.endChain(); this.requestRender(); return; }
+    if (this.isWallTool()) { this.endChain(); this.requestRender(); return; }
     if (this.isOutlineTool()) { this.finishFloor(); return; }
     if (this.tool !== 'select') return;
     const hit = this.hitTest(this.cursorScreen);
@@ -631,7 +638,7 @@ export class Editor2D {
   onContextMenu(e) {
     e.preventDefault();
     this.updatePointer(e);
-    if ((this.tool === 'wall' || this.tool === 'curve') && this.chain) { this.endChain(); this.requestRender(); return; }
+    if (this.isWallTool() && this.chain) { this.endChain(); this.requestRender(); return; }
     if (this.isOutlineTool() && this.floorDraw) { this.finishFloor(); return; }
     let hit = this.hitTest(this.cursorScreen);
     if (hit?.kind === 'floorVertex') hit = { kind: 'floor', id: hit.id };
@@ -714,10 +721,10 @@ export class Editor2D {
     }
     if (dist(p, this.chain.last) < 0.5) return; // second click of a double-click
     const r = Math.max(this.nodeSnapRadius(), 0.5);
-    const level = this.model.getLevel(this.model.activeLevel);
     const curve = this.tool === 'curve';
+    const style = TOOLS[this.tool].wallStyle;
     const w = this.model.batch(() => {
-      const wall = this.model.addWall(this.chain.last, p, { snapRadius: r, splitWalls: true, height: level?.height });
+      const wall = this.model.addWall(this.chain.last, p, { snapRadius: r, splitWalls: true, style });
       if (wall && curve) {
         const node = this.model.nodeNear(p, r);
         this.chain.pts.push(node ? { x: node.x, y: node.y } : { x: p.x, y: p.y });
@@ -920,22 +927,24 @@ export class Editor2D {
       if (!pg) continue;
       ctx.beginPath();
       this.traceWall(w, pg);
-      ctx.fillStyle = isSel('wall', w.id) ? this.c.accent : isHov('wall', w.id) ? this.c.wallHover : this.c.wall;
+      ctx.fillStyle = this.wallFill(w, state('wall', w.id));
       ctx.fill();
     }
     ctx.lineWidth = 1;
-    ctx.strokeStyle = this.c.wallEdge;
     for (const w of walls) {
       const pg = polys.get(w.id);
       if (!pg) continue;
       const ap = this.w2s(pg.aPlus), am = this.w2s(pg.aMinus);
       const bp = this.w2s(pg.bPlus), bm = this.w2s(pg.bMinus);
       ctx.beginPath();
+      ctx.strokeStyle = this.wallStroke(w);
       ctx.moveTo(ap.x, ap.y); this.traceWallSide(w, pg, true, true);
       ctx.moveTo(am.x, am.y); this.traceWallSide(w, pg, false, true);
       if (m.wallsAtNode(w.a).length === 1) { ctx.moveTo(ap.x, ap.y); ctx.lineTo(am.x, am.y); }
       if (m.wallsAtNode(w.b).length === 1) { ctx.moveTo(bp.x, bp.y); ctx.lineTo(bm.x, bm.y); }
       ctx.stroke();
+      // A railing is too thin to read as a band, so it also gets a line down its middle.
+      if (wallSpec(w.style).look === 'railing') this.strokeAlong(w, 0, m.wallLength(w), 0, this.wallStroke(w), 1);
     }
 
     for (const o of m.openings) {
@@ -948,7 +957,7 @@ export class Editor2D {
     for (const w of walls) this.drawWallLength(w, polys.get(w.id), isSel('wall', w.id));
 
     // Nodes: shown for the selection, hover, and in drawing tools as snap targets.
-    const showAllNodes = this.tool === 'wall' || this.tool === 'curve' || this.tool === 'select';
+    const showAllNodes = this.isWallTool() || this.tool === 'select';
     for (const n of m.nodes) {
       if (n.level !== L) continue;
       const s = this.w2s(n);
@@ -1023,7 +1032,7 @@ export class Editor2D {
     }
 
     // Tool previews.
-    if (this.tool === 'wall' || this.tool === 'curve') this.drawWallPreview();
+    if (this.isWallTool()) this.drawWallPreview();
     if (this.isOutlineTool()) this.drawFloorPreview();
     if (this.fillPreview) {
       this.poly(this.fillPreview.map((q) => this.w2s(q)), this.c.accentSoft, this.c.accent, 1.5);
@@ -1033,6 +1042,24 @@ export class Editor2D {
     }
     if (this.ghost) this.drawGhost(this.ghost);
     if (this.splitPreview) this.drawSplitPreview(this.splitPreview);
+  }
+
+  /**
+   * Body colour of a wall: plain walls are solid, barriers lighter, glass barriers glazed and
+   * railings hollow. state: null | 'hover' | 'selected'.
+   */
+  wallFill(w, state) {
+    if (state === 'selected') return this.c.accent;
+    if (state === 'hover') return this.c.wallHover;
+    const look = wallSpec(w.style).look;
+    if (look === 'glass') return this.c.glass;
+    if (look === 'railing') return this.c.bg;
+    return w.style ? this.c.barrier : this.c.wall;
+  }
+
+  /** Outline colour of a wall. */
+  wallStroke(w) {
+    return wallSpec(w.style).look === 'glass' ? this.c.glassEdge : this.c.wallEdge;
   }
 
   /** A level drawn faintly under the active one: walls, openings, stairs and floor outlines, no labels. */
@@ -1057,7 +1084,7 @@ export class Editor2D {
       if (!pg) continue;
       ctx.beginPath();
       this.traceWall(w, pg);
-      ctx.fillStyle = this.c.wall;
+      ctx.fillStyle = this.wallFill(w, null);
       ctx.fill();
     }
     for (const o of m.openings) {
@@ -1463,7 +1490,7 @@ export class Editor2D {
       if (dist(a, p) > EPS) {
         const bulge = this.tool === 'curve' ? (splineBulges([...this.chain.pts, p]).pop() || 0) : 0;
         const arc = arcFromChord(a, p, bulge);
-        const h = 7.5;
+        const h = wallSpec(TOOLS[this.tool].wallStyle).thickness / 2;
         const plus = arcSamples(arcOffset(arc, h)).map((q) => this.w2s(q));
         const minus = arcSamples(arcOffset(arc, -h)).map((q) => this.w2s(q));
         this.poly([...plus, ...minus.reverse()], this.c.accentSoft, this.c.accent, 1);

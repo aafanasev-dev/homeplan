@@ -19,6 +19,7 @@
   --plan-wall: #3b4049;
   --plan-wall-edge: #1f2329;
   --plan-wall-hover: #5b6370;
+  --plan-barrier: #767d89;
   --plan-door: #9a6a3a;
   --plan-glass: #cfe8f6;
   --plan-glass-edge: #2b7bb0;
@@ -48,6 +49,7 @@
     --plan-wall: #c9ccd2;
     --plan-wall-edge: #e8eaee;
     --plan-wall-hover: #a8adb6;
+    --plan-barrier: #8d939c;
     --plan-door: #d39a5f;
     --plan-glass: #24465c;
     --plan-glass-edge: #6cb6e6;

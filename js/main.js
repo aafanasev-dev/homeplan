@@ -2,7 +2,7 @@
 
 import { Model, History, createSampleModel } from './model.js';
 import { Editor2D, TOOLS } from './editor2d.js';
-import { OPENING_TYPES, MIN_OPENING_WIDTH, openingDims, openingSpec } from './catalog.js';
+import { OPENING_TYPES, MIN_OPENING_WIDTH, openingDims, openingSpec, WALL_STYLES, wallSpec } from './catalog.js';
 import { round } from './geometry.js';
 
 const STORAGE_KEY = 'homeplan.plan.v1';
@@ -38,7 +38,13 @@ const editor = new Editor2D($('#plan'), model, {
   onSelectionChange: (sel) => { renderProps(true); view3d?.setSelection(sel); },
   onCommit: () => { history.commit(); updateHistoryButtons(); },
   onToolChange: (tool) => {
-    for (const b of $$('[data-tool]')) b.setAttribute('aria-pressed', String(b.dataset.tool === tool));
+    for (const b of $$('[data-tool]')) {
+      const on = b.dataset.tool === tool;
+      b.setAttribute('aria-pressed', String(on));
+      // A keyboard shortcut must not leave its tool hidden inside a collapsed group.
+      // Select and Split sit outside the groups, so they leave the open one alone.
+      if (on && b.closest('details')) openPaletteGroup(b.closest('details'));
+    }
   },
   onStatus: (text) => { $('#status').textContent = text; },
 });
@@ -229,6 +235,18 @@ function onChromeClick(e) {
 
 for (const el of [$('.toolbar'), $('#palette')]) el.addEventListener('click', onChromeClick);
 
+// The palette is an accordion: opening one group closes the others.
+const paletteGroups = () => $$('#palette details');
+
+/** Open `group` (if any) and close every other palette group. */
+function openPaletteGroup(group) {
+  for (const d of paletteGroups()) d.open = d === group;
+}
+
+for (const d of paletteGroups()) {
+  d.addEventListener('toggle', () => { if (d.open) openPaletteGroup(d); });
+}
+
 for (const b of $$('[data-expand]')) {
   b.addEventListener('click', () => {
     const v = b.dataset.expand;
@@ -291,13 +309,15 @@ function renderProps(force = false) {
     const level = model.getLevel(model.activeLevel);
     const L = level.id;
     const walls = model.walls.filter((w) => w.level === L);
+    const barriers = walls.filter((w) => wallSpec(w.style).barrier);
     const wallIds = new Set(walls.map((w) => w.id));
     const total = walls.reduce((s, w) => s + model.wallLength(w), 0);
     html = `<h2>Plan</h2>
       ${field('Level name', `<input type="text" name="level-name" value="${esc(level.name)}" maxlength="40">`)}
       ${field('Level height (cm)', numInput('level-height', level.height, { min: 10, max: 2000, step: 10 }))}
       ${readout('Elevation', fmt(model.levelElevation(L)))}
-      ${readout('Walls', walls.length)}
+      ${readout('Walls', walls.length - barriers.length)}
+      ${readout('Barriers', barriers.length)}
       ${readout('Openings', model.openings.filter((o) => wallIds.has(o.wallId)).length)}
       ${readout('Floors', model.floors.filter((f) => f.level === L && f.kind !== 'cutout').length)}
       ${readout('Cutouts', model.floors.filter((f) => f.level === L && f.kind === 'cutout').length)}
@@ -307,7 +327,8 @@ function renderProps(force = false) {
       <p class="hint">Counts are for this level. Select a wall, corner, door, window, floor or stairs to edit it. Placement snaps to a 10 cm grid; hold Alt to place freely.</p>
       <ul class="keys">
         <li>Select <kbd>V</kbd></li><li>Wall <kbd>W</kbd></li><li>Curved wall <kbd>C</kbd></li>
-        <li>Split <kbd>S</kbd></li><li>Floor <kbd>G</kbd></li><li>Floor fill <kbd>R</kbd></li>
+        <li>Barrier <kbd>B</kbd></li><li>Split <kbd>S</kbd></li>
+        <li>Floor <kbd>G</kbd></li><li>Floor fill <kbd>R</kbd></li>
         <li>Floor cutout <kbd>H</kbd></li><li>Close outline <kbd>Enter</kbd></li><li>Stairs <kbd>T</kbd></li>
         <li>Door <kbd>D</kbd></li><li>Window <kbd>1</kbd></li><li>Tall window <kbd>2</kbd></li>
         <li>Full-height window <kbd>3</kbd></li><li>Small window <kbd>4</kbd></li>
@@ -319,7 +340,11 @@ function renderProps(force = false) {
     const w = ent;
     const arc = model.wallArc(w);
     const ends = model.wallEnds(w);
-    html = `<h2>${arc.curved ? 'Curved wall' : 'Wall'}</h2>
+    const spec = wallSpec(w.style);
+    const styles = Object.entries(WALL_STYLES)
+      .map(([k, c]) => `<option value="${k}"${k === (w.style || 'wall') ? ' selected' : ''}>${c.label}</option>`).join('');
+    html = `<h2>${arc.curved ? `Curved ${spec.label.toLowerCase()}` : spec.label}</h2>
+      ${field('Style', `<select name="style">${styles}</select>`)}
       ${readout(arc.curved ? 'Arc length' : 'Length', fmt(arc.length))}
       ${field('Bulge (cm)', numInput('bulge', w.bulge || 0, { min: -2000, max: 2000, step: 10 }))}
       ${arc.curved ? readout('Chord', fmt(Math.hypot(ends.b.x - ends.a.x, ends.b.y - ends.a.y))) : ''}
@@ -332,7 +357,7 @@ function renderProps(force = false) {
         ${arc.curved ? '<button type="button" data-prop-action="straighten">Straighten</button>' : ''}
         <button type="button" class="danger" data-prop-action="delete">Delete</button>
       </div>
-      <p class="hint">Drag the wall to move it; connected walls stretch. Drag the round handle in the middle to bend it, or set the bulge here. Double-click or right-click it to split at a point.</p>`;
+      <p class="hint">${spec.barrier ? 'A barrier is a wall that stops short of the ceiling; change its height above. ' : ''}Drag the wall to move it; connected walls stretch. Drag the round handle in the middle to bend it, or set the bulge here. Double-click or right-click it to split at a point.</p>`;
   } else if (sel.kind === 'opening') {
     const o = ent;
     const w = model.getWall(o.wallId);

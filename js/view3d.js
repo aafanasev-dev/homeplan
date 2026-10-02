@@ -2,7 +2,7 @@
 
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
-import { openingDims, openingSpec } from './catalog.js';
+import { openingDims, openingSpec, wallSpec, RAILING } from './catalog.js';
 
 const FRAME = 5;       // window / door frame width, cm
 const LEAF = 4;        // door leaf thickness, cm
@@ -77,7 +77,10 @@ export class View3D {
       }),
       floor: new THREE.MeshStandardMaterial({ color: 0xd8c8a8, roughness: 0.85 }),
       stairs: new THREE.MeshStandardMaterial({ color: 0xc9b08a, roughness: 0.75 }),
+      rail: new THREE.MeshStandardMaterial({ color: 0x9aa3ad, roughness: 0.4, metalness: 0.35 }),
     };
+    // Glass never casts a shadow, wherever it is used.
+    this.mats.glass.userData.noShadow = true;
     // Levels above the active one: see-through copies that neither write depth nor cast shadows.
     this.ghostMats = {};
     for (const [k, mat] of Object.entries(this.mats)) {
@@ -199,7 +202,7 @@ export class View3D {
     if (len <= 0.01 || h <= 0.01 || depth <= 0.01) return null;
     const mesh = new THREE.Mesh(new THREE.BoxGeometry(len, h, depth), mat);
     mesh.position.set((x0 + x1) / 2, (y0 + y1) / 2, z);
-    mesh.castShadow = shadow && !mat.userData.ghost;
+    mesh.castShadow = shadow && !mat.userData.ghost && !mat.userData.noShadow;
     mesh.receiveShadow = !mat.userData.ghost;
     parent.add(mesh);
     return mesh;
@@ -228,6 +231,67 @@ export class View3D {
       .sort((p, q) => p.s0 - q.s0);
   }
 
+  /** The stretches of a wall that are solid, with the spans of its openings taken out. */
+  solidSpans(w, L) {
+    const spans = [];
+    let cursor = 0;
+    for (const op of this.wallOpenings(w, L)) {
+      if (op.s0 > cursor) spans.push([cursor, op.s0]);
+      cursor = Math.max(cursor, op.s1);
+    }
+    if (L > cursor) spans.push([cursor, L]);
+    return spans;
+  }
+
+  /** A group placed `along` cm into the wall, turned to its tangent there: x along, y up, z across. */
+  wallFrame(parent, w, along) {
+    const p = this.model.pointOnWall(w, along), d = this.model.wallDirAt(w, along);
+    const g = new THREE.Group();
+    g.position.set(p.x, 0, p.y);
+    g.rotation.y = -Math.atan2(d.y, d.x);
+    parent.add(g);
+    return g;
+  }
+
+  /**
+   * A bar running along the wall between s0 and s1 at height y0..y1. A curved wall is stepped, so
+   * the bar follows the arc.
+   */
+  addBar(parent, w, s0, s1, y0, y1, depth, mat) {
+    const steps = w.bulge ? Math.max(1, Math.ceil((s1 - s0) / CURVE_STEP)) : 1;
+    for (let i = 0; i < steps; i++) {
+      const a = s0 + ((s1 - s0) * i) / steps, b = s0 + ((s1 - s0) * (i + 1)) / steps;
+      const half = (b - a) / 2;
+      this.box(this.wallFrame(parent, w, (a + b) / 2), -half, half, y0, y1, depth, mat);
+    }
+  }
+
+  /** The rail that finishes the top of a glass barrier. */
+  addCapRail(parent, w, mat) {
+    const L = this.model.wallLength(w);
+    for (const [s0, s1] of this.solidSpans(w, L)) {
+      this.addBar(parent, w, s0, s1, w.height - RAILING.rail / 2, w.height, w.thickness + 2, mat);
+    }
+  }
+
+  /** A railing: a top bar carried by posts, following the wall (and its curve) and skipping openings. */
+  buildRailing(parent, w, mat) {
+    const L = this.model.wallLength(w);
+    const H = w.height;
+    const railTop = Math.max(RAILING.rail, H);
+    for (const [s0, s1] of this.solidSpans(w, L)) {
+      if (s1 - s0 < 1) continue;
+      this.addBar(parent, w, s0, s1, railTop - RAILING.rail, railTop, w.thickness, mat);
+      // Posts at both ends of the span and evenly in between.
+      const n = Math.max(1, Math.round((s1 - s0) / RAILING.gap));
+      for (let i = 0; i <= n; i++) {
+        const at = s0 + ((s1 - s0) * i) / n;
+        const half = RAILING.post / 2;
+        this.box(this.wallFrame(parent, w, at), -half, half, 0, railTop - RAILING.rail, Math.min(w.thickness, RAILING.post), mat);
+      }
+    }
+  }
+
   /** How far a wall reaches past a node, to fill the joint with its neighbours. */
   wallExt(w, nodeId) {
     const others = this.model.wallsAtNode(nodeId).filter((x) => x !== w);
@@ -239,7 +303,12 @@ export class View3D {
     const sel = this.selection;
     for (const w of m.walls) {
       if (w.level !== level.id) continue;
-      const wallMat = sel?.kind === 'wall' && sel.id === w.id ? mats.wallSel : mats.wall;
+      const selected = sel?.kind === 'wall' && sel.id === w.id;
+      const look = wallSpec(w.style).look;
+      if (look === 'railing') { this.buildRailing(parent, w, selected ? mats.wallSel : mats.rail); continue; }
+      const wallMat = selected ? mats.wallSel : look === 'glass' ? mats.glass : mats.wall;
+      // A glass barrier gets a cap rail along the top, so the pane reads as a barrier.
+      if (look === 'glass') this.addCapRail(parent, w, selected ? mats.wallSel : mats.rail);
       if (w.bulge) { this.buildCurvedWall(parent, w, wallMat, mats); continue; }
       const { a, b } = m.wallEnds(w);
       const L = Math.hypot(b.x - a.x, b.y - a.y);
@@ -293,14 +362,7 @@ export class View3D {
     const T = w.thickness, H = w.height;
     const ops = this.wallOpenings(w, L);
     const steps = Math.max(1, Math.ceil(L / CURVE_STEP));
-    const frame = (along) => {
-      const g = new THREE.Group();
-      const p = m.pointOnWall(w, along), d = m.wallDirAt(w, along);
-      g.position.set(p.x, 0, p.y);
-      g.rotation.y = -Math.atan2(d.y, d.x);
-      parent.add(g);
-      return g;
-    };
+    const frame = (along) => this.wallFrame(parent, w, along);
     for (let i = 0; i < steps; i++) {
       const s0 = (L * i) / steps, s1 = (L * (i + 1)) / steps;
       const mid = (s0 + s1) / 2;

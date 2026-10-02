@@ -6,6 +6,28 @@ export const FLOOR_DEFAULTS = { thickness: 20 };
 export const STAIR_DEFAULTS = { width: 100, length: 300, riser: 18 };
 export const MIN_OPENING_WIDTH = 30;
 
+/** Default height of a barrier: a wall that stops short of the ceiling. */
+export const BARRIER_HEIGHT = 100;
+/** Rail, post and spacing sizes of a railing, in cm. */
+export const RAILING = { rail: 6, post: 4, gap: 12 };
+
+/**
+ * How a wall is built. `wall` is the default and the only style that reaches the ceiling:
+ * `height: null` means "the height of its level". The others are barriers, which carry their own
+ * height. `look` is what the 2D and 3D renderers branch on — never the key.
+ */
+export const WALL_STYLES = {
+  wall:            { label: 'Wall',          barrier: false, look: 'solid',   thickness: 15, height: null },
+  barrier_full:    { label: 'Barrier',       barrier: true,  look: 'solid',   thickness: 12, height: BARRIER_HEIGHT },
+  barrier_glass:   { label: 'Glass barrier', barrier: true,  look: 'glass',   thickness: 2,  height: BARRIER_HEIGHT },
+  barrier_railing: { label: 'Railing',       barrier: true,  look: 'railing', thickness: 6,  height: BARRIER_HEIGHT },
+};
+
+export const isWallStyle = (style) => Object.prototype.hasOwnProperty.call(WALL_STYLES, style);
+
+/** The catalog record of a wall style. Anything unknown (or missing) is a plain wall. */
+export const wallSpec = (style) => WALL_STYLES[style] || WALL_STYLES.wall;
+
 /**
  * height: null means "the full wall height" (minus the sill).
  * align: 'top' hangs the opening `head` cm below the ceiling instead of using `sill`.

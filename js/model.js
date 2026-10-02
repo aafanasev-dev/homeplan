@@ -4,7 +4,9 @@
 //
 //   levels:   { id, name, height }  ordered bottom to top; elevations are computed (levelElevation)
 //   nodes:    { id, x, y, level }
-//   walls:    { id, a: nodeId, b: nodeId, thickness, height, level, bulge? }  both nodes are on `level`
+//   walls:    { id, a: nodeId, b: nodeId, thickness, height, level, bulge?, style? }  both nodes on `level`
+//             style (see catalog.WALL_STYLES) is absent for a plain full-height wall; the barrier
+//             styles are ordinary walls that simply carry a lower height
 //             bulge is the sagitta of a curved wall in cm: how far the middle of the arc sits off
 //             the middle of the chord, along perp(unit(b - a)). Absent or 0 means a straight wall,
 //             and openings measure `t` along the arc, so nothing else has to know the difference.
@@ -26,7 +28,7 @@ import {
 } from './geometry.js';
 import {
   WALL_DEFAULTS, FLOOR_DEFAULTS, STAIR_DEFAULTS, MIN_OPENING_WIDTH, OPENING_TYPES, isOpeningType,
-  openingSpec,
+  openingSpec, isWallStyle, wallSpec,
 } from './catalog.js';
 
 export const NODE_SNAP_RADIUS = 10; // cm
@@ -183,6 +185,7 @@ export class Model {
         height: clamp(num(w.height, WALL_DEFAULTS.height), 10, 2000),
         level: na.level,
       };
+      if (isWallStyle(w.style) && w.style !== 'wall') wall.style = w.style;
       const chord = dist(na, nb);
       const bulge = clamp(num(w.bulge, 0), -chord, chord);
       if (Math.abs(bulge) >= 1e-4) wall.bulge = bulge;
@@ -277,6 +280,13 @@ export class Model {
   wallEnds(w) {
     w = this._wall(w);
     return { a: this.getNode(w.a), b: this.getNode(w.b) };
+  }
+
+  /** Thickness and height a wall of `style` gets on `level` ('wall' reaches the level height). */
+  wallStyleDefaults(level, style) {
+    const spec = wallSpec(style);
+    const height = spec.height ?? this.getLevel(level)?.height ?? WALL_DEFAULTS.height;
+    return { thickness: spec.thickness, height: clamp(height, 10, 2000) };
   }
 
   /** The wall's centre line as an arc record (straight when it has no bulge). */
@@ -478,12 +488,15 @@ export class Model {
       if (na === nb) { this.pruneOrphanNodes(); this.emit(); return null; }
       const existing = this.wallBetween(na.id, nb.id);
       if (existing) { this.emit(); return existing; }
+      const style = isWallStyle(opts.style) ? opts.style : 'wall';
+      const def = this.wallStyleDefaults(na.level, style);
       const w = {
         id: this.newId('w'), a: na.id, b: nb.id,
-        thickness: opts.thickness ?? WALL_DEFAULTS.thickness,
-        height: opts.height ?? WALL_DEFAULTS.height,
+        thickness: opts.thickness ?? def.thickness,
+        height: opts.height ?? def.height,
         level: na.level,
       };
+      if (style !== 'wall') w.style = style;
       this.walls.push(w);
       if (opts.bulge) this.setWallBulge(w, opts.bulge);
       this.emit();
@@ -581,6 +594,7 @@ export class Model {
     const node = this.addNode(p.x, p.y, w.level);
     const w1 = { id: this.newId('w'), a: w.a, b: node.id, thickness: w.thickness, height: w.height, level: w.level };
     const w2 = { id: this.newId('w'), a: node.id, b: w.b, thickness: w.thickness, height: w.height, level: w.level };
+    if (w.style) { w1.style = w.style; w2.style = w.style; }
     if (arc.curved) {
       // Both halves keep the curvature: each takes its share of the sweep over its own chord.
       const sweep1 = arc.sweep * (along / L);
@@ -615,6 +629,14 @@ export class Model {
   updateWall(id, props = {}) {
     const w = this.getWall(id);
     if (!w) return false;
+    if (props.style != null && isWallStyle(props.style) && props.style !== (w.style || 'wall')) {
+      // A new style brings its own proportions, unless the same call sets them explicitly.
+      const def = this.wallStyleDefaults(w.level, props.style);
+      if (props.style === 'wall') delete w.style;
+      else w.style = props.style;
+      if (props.thickness == null) w.thickness = def.thickness;
+      if (props.height == null) w.height = def.height;
+    }
     if (props.thickness != null && Number.isFinite(+props.thickness)) w.thickness = clamp(+props.thickness, 1, 200);
     if (props.height != null && Number.isFinite(+props.height)) w.height = clamp(+props.height, 10, 2000);
     if (props.bulge != null) this.setWallBulge(w, props.bulge);
