@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Set your password — Home Plan</title>
+  <style>
+    :root {
+      --bg: #f3f2ee; --panel: #fff; --border: #dcd9d0; --text: #1f2329; --muted: #6b6f76;
+      --accent: #2563eb; --accent-text: #fff; --danger: #dc2626; color-scheme: light;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root:not([data-theme="light"]) {
+        --bg: #17191c; --panel: #1f2226; --border: #33373d; --text: #e6e7e9; --muted: #9aa0a8;
+        --accent: #5b8def; color-scheme: dark;
+      }
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; min-height: 100vh; display: grid; place-items: center; padding: 24px;
+      background: var(--bg); color: var(--text); font: 14px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    }
+    main { width: 100%; max-width: 380px; background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 24px; }
+    h1 { font-size: 18px; margin: 0 0 4px; }
+    p { color: var(--muted); margin: 0 0 16px; }
+    label { display: block; margin: 12px 0 4px; }
+    input {
+      font: inherit; width: 100%; padding: 7px 9px; color: var(--text); background: var(--bg);
+      border: 1px solid var(--border); border-radius: 6px;
+    }
+    input:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+    button {
+      font: inherit; width: 100%; margin-top: 16px; padding: 8px 12px; cursor: pointer;
+      color: var(--accent-text); background: var(--accent); border: 1px solid var(--accent); border-radius: 6px;
+    }
+    button:disabled { opacity: .5; cursor: default; }
+    .msg { margin-top: 12px; color: var(--danger); }
+    .msg:empty { display: none; }
+    a { color: var(--accent); }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Set your password</h1>
+    <p id="who">Checking your invite…</p>
+    <form id="form" hidden>
+      <label for="pw">Password</label>
+      <input type="password" id="pw" autocomplete="new-password" minlength="10" required>
+      <label for="pw2">Repeat it</label>
+      <input type="password" id="pw2" autocomplete="new-password" minlength="10" required>
+      <button type="submit">Set password and sign in</button>
+    </form>
+    <p class="msg" id="msg"></p>
+  </main>
+
+  <script type="module">
+    const token = location.pathname.split('/').pop();
+    const who = document.querySelector('#who');
+    const form = document.querySelector('#form');
+    const msg = document.querySelector('#msg');
+
+    const show = (text) => { msg.textContent = text; };
+
+    try {
+      const res = await fetch(`/api/invite/${encodeURIComponent(token)}`);
+      const body = await res.json();
+      if (!res.ok) throw new Error(body.error || 'That invite link is not valid any more.');
+      who.textContent = `Pick a password for ${body.email}. It needs at least 10 characters.`;
+      form.hidden = false;
+      form.querySelector('#pw').focus();
+    } catch (e) {
+      who.textContent = e.message;
+      show('Ask whoever invited you for a new link.');
+    }
+
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      show('');
+      const pw = form.querySelector('#pw').value;
+      if (pw !== form.querySelector('#pw2').value) { show('Those two passwords are different.'); return; }
+      const button = form.querySelector('button');
+      button.disabled = true;
+      try {
+        const res = await fetch(`/api/invite/${encodeURIComponent(token)}`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ password: pw }),
+        });
+        const body = await res.json();
+        if (!res.ok) throw new Error(body.error || 'That did not work.');
+        location.href = '/';
+      } catch (e) {
+        show(e.message);
+        button.disabled = false;
+      }
+    });
+  </script>
+</body>
+</html>

@@ -7,8 +7,11 @@ import {
   STAIR_KINDS, stairKindSpec, FURNITURE_TYPES, furnitureSpec,
 } from './catalog.js';
 import { round } from './geometry.js';
+import { initCloud } from './cloud.js';
 
 const STORAGE_KEY = 'homeplan.plan.v1';
+/** /s/<token> opens the editor on someone else's shared plan, read only. */
+const PREVIEW_TOKEN = (/^\/s\/([\w-]+)$/.exec(location.pathname) || [])[1] || null;
 const VIEW_KEY = 'homeplan.view';
 
 const $ = (sel) => document.querySelector(sel);
@@ -23,6 +26,7 @@ function storageSet(key, value) {
 }
 
 function loadInitialModel() {
+  if (PREVIEW_TOKEN) return new Model(); // js/cloud.js fills it from the share link
   const saved = storageGet(STORAGE_KEY);
   if (saved) {
     try { return new Model(saved); } catch (e) { console.warn('Ignoring unreadable saved plan', e); }
@@ -72,12 +76,15 @@ import('./view3d.js')
 
 let saveTimer = 0;
 model.on(() => {
-  clearTimeout(saveTimer);
-  saveTimer = setTimeout(() => storageSet(STORAGE_KEY, model.serialize()), 300);
+  // Previewing someone else's plan must never overwrite the plan this browser was working on.
+  if (!PREVIEW_TOKEN) {
+    clearTimeout(saveTimer);
+    saveTimer = setTimeout(() => storageSet(STORAGE_KEY, model.serialize()), 300);
+  }
   syncLevel(); // the active level can change through undo, import, "New" or deleting a level
   renderProps();
 });
-window.addEventListener('beforeunload', () => storageSet(STORAGE_KEY, model.serialize()));
+window.addEventListener('beforeunload', () => { if (!PREVIEW_TOKEN) storageSet(STORAGE_KEY, model.serialize()); });
 
 // ------------------------------------------------------------------ history
 
@@ -105,7 +112,7 @@ updateHistoryButtons();
 function setView(view) {
   if (!['split', '2d', '3d'].includes(view)) view = 'split';
   $('#workspace').dataset.view = view;
-  for (const b of $$('[data-view]')) b.setAttribute('aria-pressed', String(b.dataset.view === view));
+  for (const b of $$('button[data-view]')) b.setAttribute('aria-pressed', String(b.dataset.view === view));
   for (const b of $$('[data-expand]')) b.textContent = view === b.dataset.expand ? 'Restore' : 'Expand';
   storageSet(VIEW_KEY, view);
 }
@@ -273,6 +280,15 @@ window.addEventListener('keydown', (e) => {
   }
   const mod = e.ctrlKey || e.metaKey;
   const key = e.key.toLowerCase();
+  if (mod && key === 's') { e.preventDefault(); cloud?.save(); return; }
+  if (editor.readOnly) {
+    // Preview mode: looking around is fine, editing is not.
+    if (e.key === 'Escape') editor.cancel();
+    if (key === 'f') fitAll();
+    if (e.key === 'PageUp') { e.preventDefault(); stepLevel(1); }
+    if (e.key === 'PageDown') { e.preventDefault(); stepLevel(-1); }
+    return;
+  }
   if (mod && key === 'z' && !e.shiftKey) { e.preventDefault(); undo(); return; }
   if (mod && (key === 'y' || (key === 'z' && e.shiftKey))) { e.preventDefault(); redo(); return; }
   if (mod || e.altKey) return;
@@ -303,6 +319,7 @@ function numInput(name, value, { min = 0, max = 10000, step = 1 } = {}) {
 
 function renderProps(force = false) {
   const body = $('#props-body');
+  if (PREVIEW_TOKEN) { renderPreviewProps(body); return; }
   if (!force && body.contains(document.activeElement) && document.activeElement.tagName !== 'BUTTON') return;
   const sel = editor.selection;
   const ent = sel ? model.getEntity(sel.kind, sel.id) : null;
@@ -463,6 +480,26 @@ function renderProps(force = false) {
   body.innerHTML = html;
 }
 
+/** What the properties panel shows for a shared plan: what is in it, nothing to edit. */
+function renderPreviewProps(body) {
+  const L = model.activeLevel;
+  const level = model.getLevel(L);
+  const walls = model.walls.filter((w) => w.level === L);
+  const barriers = walls.filter((w) => wallSpec(w.style).barrier);
+  const wallIds = new Set(walls.map((w) => w.id));
+  const total = walls.reduce((s, w) => s + model.wallLength(w), 0);
+  body.innerHTML = `<h2>Shared plan</h2>
+    ${readout('Level', esc(level?.name ?? ''))}
+    ${readout('Walls', walls.length - barriers.length)}
+    ${readout('Barriers', barriers.length)}
+    ${readout('Openings', model.openings.filter((o) => wallIds.has(o.wallId)).length)}
+    ${readout('Floors', model.floors.filter((f) => f.level === L && f.kind !== 'cutout').length)}
+    ${readout('Stairs', model.stairs.filter((st) => st.level === L).length)}
+    ${readout('Furniture', model.furniture.filter((f) => f.level === L).length)}
+    ${readout('Total wall length', `${round(total / 100, 2)} m`)}
+    <p class="hint">This plan is shared read-only. Pan, zoom, switch levels and look at it in 3D; nothing here changes the original.</p>`;
+}
+
 $('#props-body').addEventListener('change', (e) => {
   const el = e.target;
   const sel = editor.selection;
@@ -520,3 +557,14 @@ $('#props-body').addEventListener('click', (e) => {
 });
 
 renderProps(true);
+
+// ------------------------------------------------------------------ server account (optional)
+
+const cloud = initCloud({
+  model,
+  history,
+  editor,
+  previewToken: PREVIEW_TOKEN,
+  storageKey: STORAGE_KEY,
+  onPlanLoaded: () => { editor.setSelection(null); updateHistoryButtons(); syncLevel(); renderProps(true); fitAll(); },
+});

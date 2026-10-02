@@ -1,5 +1,9 @@
 *
 !index.html
+!invite.html
 !style.css
 !js/
+!server/
+!add_user.sh
 js/model.test.js
+server/*.test.mjs

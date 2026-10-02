@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Home Plan Editor</title>
-  <link rel="stylesheet" href="style.css">
+  <link rel="stylesheet" href="/style.css">
   <script type="importmap">
   {
     "imports": {
@@ -41,6 +41,9 @@
       <button type="button" data-action="export" title="Save the plan as a JSON file">Export</button>
       <input type="file" id="import-file" accept=".json,application/json" hidden>
     </div>
+
+    <!-- Sign in, saved plans and share links; filled in by js/cloud.js. -->
+    <div class="group account" id="account" aria-label="Account"></div>
   </header>
 
   <main class="workspace" id="workspace" data-view="split">
@@ -147,6 +150,6 @@
     </aside>
   </main>
 
-  <script type="module" src="js/main.js"></script>
+  <script type="module" src="/js/main.js"></script>
 </body>
 </html>

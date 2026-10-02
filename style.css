@@ -379,3 +379,101 @@ kbd {
   .pane { border-right: 0; border-bottom: 1px solid var(--border); }
   .pane-hint { display: none; }
 }
+
+/* ------------------------------------------------------------ account bar, dialogs, sharing */
+
+.account { margin-left: auto; align-items: center; }
+.account .who {
+  align-self: center;
+  max-width: 180px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 600;
+}
+
+.cloud-dialog {
+  width: min(420px, calc(100vw - 32px));
+  padding: 0;
+  color: var(--text);
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  box-shadow: 0 10px 40px rgba(0, 0, 0, 0.25);
+}
+.cloud-dialog::backdrop { background: rgba(0, 0, 0, 0.35); }
+.cloud-dialog form { padding: 18px; }
+.cloud-dialog h2 { margin: 0 0 12px; font-size: 16px; }
+.cloud-dialog label { display: block; margin-bottom: 10px; color: var(--muted); }
+.cloud-dialog label.radio { color: var(--text); }
+.cloud-dialog input[type="email"],
+.cloud-dialog input[type="password"],
+.cloud-dialog input[type="text"] {
+  font: inherit;
+  display: block;
+  width: 100%;
+  margin-top: 4px;
+  padding: 6px 8px;
+  color: var(--text);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+.cloud-dialog .actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 14px; }
+.cloud-dialog button.primary {
+  color: var(--accent-text);
+  background: var(--accent);
+  border-color: var(--accent);
+}
+.cloud-dialog .hint { color: var(--muted); margin: 12px 0 0; font-size: 12px; }
+.cloud-dialog .msg { margin: 10px 0 0; }
+.cloud-dialog .msg.bad { color: var(--danger); }
+
+.plan-list { list-style: none; margin: 0; padding: 0; max-height: 50vh; overflow-y: auto; }
+.plan-list li {
+  display: grid;
+  grid-template-columns: 1fr auto auto;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 0;
+  border-bottom: 1px solid var(--border);
+}
+.plan-list .name { font-weight: 600; overflow-wrap: anywhere; }
+.plan-list .when { grid-column: 1; grid-row: 2; color: var(--muted); font-size: 12px; }
+.plan-list li.empty { display: block; color: var(--muted); }
+
+.banner {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex: none;
+  padding: 7px 12px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--border);
+}
+.banner span { color: var(--muted); }
+.banner.bad { color: var(--danger); }
+.banner a { margin-left: auto; color: var(--accent); }
+.banner button.primary {
+  color: var(--accent-text);
+  background: var(--accent);
+  border-color: var(--accent);
+}
+
+/* Preview of a shared plan: no palette, no editing buttons. */
+body[data-mode="preview"] .palette { display: none; }
+body[data-mode="preview"] .workspace { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) 260px; }
+body[data-mode="preview"] .workspace[data-view="2d"],
+body[data-mode="preview"] .workspace[data-view="3d"] { grid-template-columns: minmax(0, 1fr) 260px; }
+body[data-mode="preview"] [data-action="undo"],
+body[data-mode="preview"] [data-action="redo"],
+body[data-mode="preview"] [data-action="new"],
+body[data-mode="preview"] [data-action="import"],
+body[data-mode="preview"] [data-action="add-level"] { display: none; }
+body[data-mode="preview"]:not([data-share="copy"]) [data-action="export"] { display: none; }
+
+@media (max-width: 860px) {
+  body[data-mode="preview"] .workspace,
+  body[data-mode="preview"] .workspace[data-view="2d"],
+  body[data-mode="preview"] .workspace[data-view="3d"] { grid-template-columns: minmax(0, 1fr); }
+}

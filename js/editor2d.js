@@ -77,6 +77,7 @@ export class Editor2D {
     this.dpr = 1;
 
     this.tool = 'select';
+    this.readOnly = false; // preview mode: look, pan and select, but change nothing
     this.selection = null; // { kind: 'node'|'wall'|'opening'|'floor'|'stairs', id }
     this.hover = null;
     this.drag = null;
@@ -180,8 +181,21 @@ export class Editor2D {
 
   // ---------------------------------------------------------------- public API
 
+  /** Preview mode: the plan can be looked at, panned and selected, but not edited. */
+  setReadOnly(on) {
+    this.readOnly = !!on;
+    if (this.readOnly) {
+      this.endChain();
+      this.floorDraw = null;
+      this.hideMenu();
+      this.setTool('select');
+    }
+    this.requestRender();
+  }
+
   setTool(tool) {
     if (!TOOLS[tool]) return;
+    if (this.readOnly && tool !== 'select') return;
     this.endChain();
     this.floorDraw = null;
     this.tool = tool;
@@ -321,7 +335,7 @@ export class Editor2D {
     const p = this.s2w(screen);
     const m = this.model;
     const L = m.activeLevel;
-    if (this.selection?.kind === 'opening') {
+    if (!this.readOnly && this.selection?.kind === 'opening') {
       const o = m.getOpening(this.selection.id);
       if (o) {
         for (const h of this.openingHandles(o)) {
@@ -329,18 +343,18 @@ export class Editor2D {
         }
       }
     }
-    if (this.selection?.kind === 'furniture' || this.selection?.kind === 'stairs') {
+    if (!this.readOnly && (this.selection?.kind === 'furniture' || this.selection?.kind === 'stairs')) {
       const h = this.rotateHandlePos(this.selection);
       if (h && dist(this.w2s(h), screen) <= 9) return { kind: 'rotate', id: this.selection.id, on: this.selection.kind };
     }
-    if (this.selection?.kind === 'wall') {
+    if (!this.readOnly && this.selection?.kind === 'wall') {
       const w = m.getWall(this.selection.id);
       if (w && w.level === L) {
         const mid = this.w2s(m.pointOnWall(w, m.wallLength(w) / 2));
         if (dist(mid, screen) <= 8) return { kind: 'bulge', id: w.id };
       }
     }
-    if (this.selection?.kind === 'floor') {
+    if (!this.readOnly && this.selection?.kind === 'floor') {
       const f = m.getFloor(this.selection.id);
       if (f) {
         for (let i = 0; i < f.points.length; i++) {
@@ -557,6 +571,7 @@ export class Editor2D {
   }
 
   startDrag(e, drag) {
+    if (this.readOnly && drag.kind !== 'pan') drag = { kind: 'pan' }; // dragging anything just pans
     drag.downScreen = this.cursorScreen;
     drag.lastScreen = this.cursorScreen;
     drag.moved = false;
@@ -729,6 +744,7 @@ export class Editor2D {
 
   onDoubleClick(e) {
     this.updatePointer(e);
+    if (this.readOnly) return;
     if (this.isWallTool()) { this.endChain(); this.requestRender(); return; }
     if (this.isOutlineTool()) { this.finishFloor(); return; }
     if (this.tool !== 'select') return;
@@ -742,6 +758,7 @@ export class Editor2D {
   onContextMenu(e) {
     e.preventDefault();
     this.updatePointer(e);
+    if (this.readOnly) { this.hideMenu(); return; }
     if (this.isWallTool() && this.chain) { this.endChain(); this.requestRender(); return; }
     if (this.isOutlineTool() && this.floorDraw) { this.finishFloor(); return; }
     let hit = this.hitTest(this.cursorScreen);
@@ -783,7 +800,7 @@ export class Editor2D {
 
   deleteSelection() {
     const s = this.selection;
-    if (!s) return false;
+    if (!s || this.readOnly) return false;
     if (this.model.deleteEntity(s.kind, s.id)) {
       this.setSelection(null);
       this.commit();
@@ -1095,7 +1112,7 @@ export class Editor2D {
     }
 
     // Opening resize handles.
-    if (sel?.kind === 'opening') {
+    if (sel?.kind === 'opening' && !this.readOnly) {
       const o = m.getOpening(sel.id);
       if (o) {
         for (const h of this.openingHandles(o)) {
@@ -1116,7 +1133,7 @@ export class Editor2D {
     }
 
     // The handle that bends the selected wall, at the middle of its centre line.
-    if (sel?.kind === 'wall') {
+    if (sel?.kind === 'wall' && !this.readOnly) {
       const w = m.getWall(sel.id);
       if (w && w.level === L) {
         const c0 = this.w2s(m.pointOnWall(w, m.wallLength(w) / 2));
@@ -1132,7 +1149,7 @@ export class Editor2D {
     }
 
     // Floor corner handles.
-    if (sel?.kind === 'floor') {
+    if (sel?.kind === 'floor' && !this.readOnly) {
       const f = m.getFloor(sel.id);
       if (f) {
         f.points.forEach((q, i) => {
@@ -1168,7 +1185,7 @@ export class Editor2D {
       }, 'ghost');
     }
     // The handle that turns the selected stairs or furniture.
-    if (sel?.kind === 'furniture' || sel?.kind === 'stairs') {
+    if ((sel?.kind === 'furniture' || sel?.kind === 'stairs') && !this.readOnly) {
       const h = this.rotateHandlePos(sel);
       if (h) {
         const hs = this.w2s(h);
